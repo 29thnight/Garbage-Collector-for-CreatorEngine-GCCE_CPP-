@@ -11,7 +11,7 @@ using gctest::node;
 
 namespace
 {
-struct animal
+struct animal : gc::managed
 {
     virtual ~animal() = default;
     virtual std::string sound() const = 0;
@@ -36,11 +36,11 @@ struct right_base
     int r = 2;
     virtual ~right_base() = default;
 };
-struct both : left_base, right_base
+struct both : gc::managed, left_base, right_base
 {
 };
 
-struct widget : gc::enable_ref_from_this<widget>
+struct widget : gc::managed, gc::enable_ref_from_this<widget>
 {
     gc::root_ref<widget> seen_in_constructor;
     widget() { seen_in_constructor = root_from_this(); }

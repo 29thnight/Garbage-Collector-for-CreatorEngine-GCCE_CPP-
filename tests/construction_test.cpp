@@ -8,7 +8,7 @@ using gctest::node;
 
 namespace
 {
-struct may_throw
+struct may_throw : gc::managed
 {
     static inline int constructed = 0;
     static inline int destroyed = 0;
@@ -25,7 +25,7 @@ struct may_throw
     void gc_trace(gc::tracer& t) const { t.visit(child); }
 };
 
-struct member_throws
+struct member_throws : gc::managed
 {
     std::string text = "ok";
     struct thrower
@@ -34,7 +34,7 @@ struct member_throws
     } m;
 };
 
-struct nested_parent
+struct nested_parent : gc::managed
 {
     gc::trace_ref<node> a;
     gc::trace_ref<node> b;
@@ -46,7 +46,7 @@ struct nested_parent
     }
 };
 
-struct collects_in_constructor
+struct collects_in_constructor : gc::managed
 {
     gc::collect_result result;
     gc::step_result step;
@@ -112,18 +112,19 @@ namespace
 {
 gc::domain* g_domain = nullptr;
 
-struct allocates_in_trace
+struct allocates_in_trace : gc::managed
 {
     void gc_trace(gc::tracer&) const { (void)gc::make<node>(*g_domain, 0); }
 };
 
-struct collects_in_destructor
+struct collects_in_destructor : gc::managed
 {
     gc::domain* d;
+    explicit collects_in_destructor(gc::domain* domain) : d(domain) {}
     ~collects_in_destructor() { (void)d->collect_full(); }
 };
 
-struct republishes_itself
+struct republishes_itself : gc::managed
 {
     gc::trace_ref<republishes_itself> self;
     ~republishes_itself() { gc::root_ref<republishes_itself> resurrect = self; }

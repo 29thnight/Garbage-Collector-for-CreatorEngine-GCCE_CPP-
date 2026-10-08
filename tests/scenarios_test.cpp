@@ -17,7 +17,7 @@ using gctest::live;
 
 namespace
 {
-struct list_node
+struct list_node : gc::managed
 {
     int value;
     gc::trace_ref<list_node> next;
@@ -30,7 +30,7 @@ struct list_node
     }
 };
 
-struct linked_list
+struct linked_list : gc::managed
 {
     gc::trace_ref<list_node> head;
     gc::trace_ref<list_node> tail;
@@ -103,7 +103,7 @@ TEST(Scenarios, DoublyLinkedList)
 
 namespace
 {
-struct tree_node
+struct tree_node : gc::managed
 {
     int key;
     gc::trace_ref<tree_node> left;
@@ -117,7 +117,7 @@ struct tree_node
     }
 };
 
-struct bst
+struct bst : gc::managed
 {
     gc::trace_ref<tree_node> root;
     void gc_trace(gc::tracer& t) const { t.visit(root); }
@@ -199,7 +199,7 @@ TEST(Scenarios, BinarySearchTreeWithWeakParents)
 
 namespace
 {
-struct vertex
+struct vertex : gc::managed
 {
     std::string name;
     std::vector<gc::trace_ref<vertex>> out;
@@ -253,14 +253,14 @@ TEST(Scenarios, GraphComponentsAreReclaimedWhenDisconnected)
 
 namespace
 {
-struct texture_like
+struct texture_like : gc::managed
 {
     int key;
     std::vector<unsigned char> pixels = std::vector<unsigned char>(256);
     explicit texture_like(int k) : key(k) {}
 };
 
-class lru_cache
+class lru_cache : public gc::managed
 {
 public:
     explicit lru_cache(std::size_t capacity) : capacity_(capacity) {}
@@ -318,12 +318,12 @@ TEST(Scenarios, LruCacheEvictionDoesNotFreeEntriesStillInUse)
 
 namespace
 {
-struct listener
+struct listener : gc::managed
 {
     int received = 0;
 };
 
-struct subject
+struct subject : gc::managed
 {
     std::vector<gc::weak_ref<listener>> listeners; // observers are not owned
 

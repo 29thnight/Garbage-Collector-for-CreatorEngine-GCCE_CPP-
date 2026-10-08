@@ -7,7 +7,7 @@ using gctest::node;
 
 namespace
 {
-struct blob
+struct blob : gc::managed
 {
     unsigned char bytes[1024];
 };

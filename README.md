@@ -11,7 +11,7 @@ C++20 tracing GC 라이브러리. 명시적 루트와 정확한 추적을 사용
 
 struct Item;
 
-struct Inventory
+struct Inventory : gc::managed
 {
     std::vector<gc::trace_ref<Item>> items; // 강한 간선
     gc::weak_ref<Inventory> parent;         // 관찰용 역참조
@@ -19,7 +19,7 @@ struct Inventory
     void gc_trace(gc::tracer& t) const { t.visit(items); }
 };
 
-struct Item : gc::enable_ref_from_this<Item>
+struct Item : gc::managed, gc::enable_ref_from_this<Item>
 {
     gc::trace_ref<Inventory> owner;
     void gc_trace(gc::tracer& t) const { t.visit(owner); }
@@ -36,6 +36,30 @@ domain.collect_step({std::chrono::microseconds(250), 16});
 // 로딩·종료 경계에서
 domain.collect_full();
 ```
+
+## GC 타입과 생성·소멸 경로
+
+GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸은 수집기만 한다. `gc::managed`는 클래스 범위의 할당 함수로 다른 경로를 컴파일 단계에서 막는다.
+
+| 외부 코드 | 결과 |
+| --- | --- |
+| `new T`, `new T[n]`, `new (std::nothrow) T`, `new (p) T`, `std::make_unique<T>()` | 컴파일 오류 |
+| `delete p`, `std::unique_ptr<T>` | 컴파일 오류 |
+| `gc::make<T>`에서 `T`가 `gc::managed`를 상속하지 않음 | 컴파일 오류 |
+| 클래스 자신의 멤버 함수 안의 `delete this` | 컴파일되지만 실행 시 메시지 후 중단 |
+| 전역 한정 `::new (p) T` | 막지 않음 (의도적 우회) |
+
+`operator delete`를 삭제하거나 private으로 두면 가상 소멸자를 가진 GC 타입이 컴파일되지 않으므로 protected로 둔다. `gc::managed`는 빈 기반 클래스라 객체 크기를 늘리지 않는다. 스택, 전역, 다른 객체의 값 멤버로 GC 타입을 두는 것은 막지 않는다.
+
+## 할당자
+
+도메인마다 전용 블록 할당자를 둔다. 블록은 객체 헤더와 객체를 함께 담는다.
+
+- 2 KiB 이하이고 정렬이 16 이하인 블록은 64 KiB 페이지를 24개 크기 클래스로 나누어 할당하고, 해제된 블록은 페이지의 free list로 재사용한다.
+- 비게 된 페이지는 클래스마다 하나만 남기고 반환한다.
+- 더 크거나 정렬이 더 큰 블록은 개별 할당한다.
+- ASan 빌드에서는 해제된 블록을 poison해 재사용 전 접근을 탐지하고, 일반 Debug 빌드에서는 0xDD로 채운다.
+- `stats().heap_committed_bytes`, `heap_pages`로 확보량을 관찰한다.
 
 ## 참조 타입
 
@@ -127,6 +151,9 @@ ctest --test-dir build --output-on-failure
 | `threading_test` | owner 스레드 위반, owner 이동, 보존된 객체의 병렬 읽기, 독립 도메인 |
 | `shutdown_test` | 종료 시 회수, 진행 중 사이클 종료, 남은 root와 정리 의무 |
 | `scenarios_test` | 이중 연결 리스트, weak 부모를 가진 BST, 그래프, LRU 캐시, observer, 클로저 |
+| `managed_test` | 모든 할당 형태의 컴파일 차단(정적 검사), 다형 타입 동작, `delete this` death test |
+| `allocator_test` | 페이지 할당, 블록 재사용, 빈 페이지 반환, 큰 객체, 정렬, 주소 중복 없음 |
+| `compile_fail/` | `new`, `new[]`, nothrow, placement, `delete`, `unique_ptr`, 비관리 타입 `make`가 빌드 실패하는지 확인. 각 경우마다 문제 줄만 뺀 대조 빌드가 성공해야 한다 |
 | `stress_test` | seed 40개의 무작위 그래프. 전체 수집은 oracle과 정확히 일치, 증분 수집은 도달 가능 객체를 회수하지 않고 안정화 후 garbage를 남기지 않음 |
 
 barrier 제거, 판정 직전 표시 작업 재소진 제거, 할당 cutoff 제거, Mark 중 정리 의무 표시 제거, 격리 루트 스캔 제거의 다섯 가지 구현 변형을 각각 테스트가 탐지하는지 확인했다.

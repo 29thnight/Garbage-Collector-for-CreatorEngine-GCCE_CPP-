@@ -13,11 +13,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if(GCCE_BUILD_SHARED)
-    add_library(gcce SHARED src/domain.cpp)
+    add_library(gcce SHARED src/domain.cpp src/block_allocator.cpp)
     target_compile_definitions(gcce PUBLIC GCCE_SHARED PRIVATE GCCE_BUILDING)
     set_target_properties(gcce PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
 else()
-    add_library(gcce STATIC src/domain.cpp)
+    add_library(gcce STATIC src/domain.cpp src/block_allocator.cpp)
 endif()
 add_library(gcce::gcce ALIAS gcce)
 

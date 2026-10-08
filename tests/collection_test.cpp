@@ -73,7 +73,7 @@ TEST(Collection, DeepListDoesNotOverflowTheStack)
 
 namespace
 {
-struct shape
+struct shape : gc::managed
 {
     static inline int destroyed = 0;
     gc::trace_ref<node> tag;
@@ -134,7 +134,7 @@ TEST(Collection, PolymorphicHierarchy)
 
 namespace
 {
-struct vbase
+struct vbase : gc::managed
 {
     gc::trace_ref<node> shared;
     virtual ~vbase() = default;
@@ -169,15 +169,15 @@ TEST(Collection, VirtualInheritance)
 #endif
 namespace
 {
-struct alignas(64) cache_line
+struct alignas(64) cache_line : gc::managed
 {
     unsigned char data[64];
 };
-struct alignas(256) over_aligned
+struct alignas(256) over_aligned : gc::managed
 {
     int v = 3;
 };
-struct empty
+struct empty : gc::managed
 {
 };
 } // namespace
@@ -214,7 +214,7 @@ struct resource_counter
 
 // Non-GC members are owned normally and released by the C++ destructor
 // when the object is reclaimed.
-struct holder
+struct holder : gc::managed
 {
     std::string name = std::string(100, 'x');
     std::vector<int> values = std::vector<int>(1000, 1);
@@ -240,9 +240,10 @@ TEST(Collection, ReclaimRunsDestructorsOfOrdinaryMembers)
 
 TEST(Collection, DestructorRunsExactlyOnce)
 {
-    struct counted
+    struct counted : gc::managed
     {
         int* counter;
+        explicit counted(int* c) : counter(c) {}
         ~counted() { ++*counter; }
     };
 

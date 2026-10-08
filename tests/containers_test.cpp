@@ -44,7 +44,7 @@ struct impl_data
     void gc_trace(gc::tracer& t) const { t.visit(items); }
 };
 
-struct everything
+struct everything : gc::managed
 {
     std::array<gc::trace_ref<node>, 2> fixed;
     std::deque<gc::trace_ref<node>> queue;

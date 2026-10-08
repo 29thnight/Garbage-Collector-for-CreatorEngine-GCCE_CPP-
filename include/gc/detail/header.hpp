@@ -44,6 +44,7 @@ struct object_header
     // Gray and black are not distinguished: the insertion barrier shades the
     // target regardless of the color of the object holding the reference.
     std::uint32_t mark_epoch = 0;
+    std::uint8_t size_class = 0; // allocator bookkeeping
     lifecycle_state lifecycle = lifecycle_state::alive;
     // Set once engine registration starts; cleared on reaching destroyed.
     bool cleanup_obligation = false;

@@ -9,7 +9,7 @@ using gctest::node;
 
 namespace
 {
-struct leaf
+struct leaf : gc::managed
 {
 };
 } // namespace

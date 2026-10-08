@@ -13,9 +13,9 @@ struct ref_from_this_base
 } // namespace detail
 
 // Lets a GC object obtain references to itself, like
-// std::enable_shared_from_this. Inherit publicly:
+// std::enable_shared_from_this. Inherit publicly, next to gc::managed:
 //
-//     struct widget : gc::enable_ref_from_this<widget> { ... };
+//     struct widget : gc::managed, gc::enable_ref_from_this<widget> { ... };
 //
 // gc::make sets the identity after the constructor returns, so inside the
 // constructor (and for objects not created by gc::make) root_from_this()

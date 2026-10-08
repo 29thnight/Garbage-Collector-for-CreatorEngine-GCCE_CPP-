@@ -54,7 +54,7 @@ private:
 };
 
 // General purpose graph node.
-struct node
+struct node : gc::managed
 {
     static inline int alive = 0;
 

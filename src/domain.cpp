@@ -1,5 +1,8 @@
 #include "gc/domain.hpp"
+#include "gc/managed.hpp"
 #include "gc/tracer.hpp"
+
+#include "block_allocator.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -52,6 +55,16 @@ void default_violation_handler(const violation& v)
 }
 } // namespace
 
+namespace detail
+{
+void managed_delete_called() noexcept
+{
+    std::fprintf(stderr, "gc: operator delete called on a gc::managed object; "
+                         "GC objects are destroyed only by the collector\n");
+    std::abort();
+}
+} // namespace detail
+
 const char* to_string(violation_kind kind) noexcept
 {
     switch (kind)
@@ -74,6 +87,7 @@ struct domain::impl
     detail::root_node roots; // circular list sentinel
     std::size_t root_count = 0;
 
+    detail::block_allocator allocator;
     std::vector<slot> slots;
     std::vector<std::uint32_t> free_slots;
 
@@ -158,12 +172,16 @@ domain::~domain()
         s.root_count = 0;
         if (s.live_objects != 0)
             report(violation_kind::objects_remaining_at_shutdown, nullptr);
+        s.allocator.leak();
         return;
     }
 
     collect_full();
     if (s.live_objects != 0)
+    {
         report(violation_kind::objects_remaining_at_shutdown, nullptr);
+        s.allocator.leak();
+    }
 }
 
 void domain::report(violation_kind kind, const detail::object_header* header) noexcept
@@ -224,6 +242,8 @@ statistics domain::stats() const
     st.last_cycle_wall = s.last_cycle_wall;
     st.last_cycle_steps = s.last_cycle_steps;
     st.peak_live_bytes = s.peak_live_bytes;
+    st.heap_committed_bytes = s.allocator.committed_bytes();
+    st.heap_pages = s.allocator.page_count();
     st.memory_limit = s.pacing_config.memory_limit;
     st.allocations_over_limit = s.allocations_over_limit;
     st.quarantined = s.quarantine.size();
@@ -243,7 +263,8 @@ domain::pending_allocation domain::begin_allocation(const detail::type_descripto
     const std::size_t offset = round_up(sizeof(detail::object_header), type.align);
     const std::size_t size = offset + type.size;
 
-    void* block = ::operator new(size, std::align_val_t{align});
+    const detail::block_allocator::allocation storage = s.allocator.allocate(size, align);
+    void* block = storage.block;
 
     std::uint32_t index;
     try
@@ -265,7 +286,7 @@ domain::pending_allocation domain::begin_allocation(const detail::type_descripto
     }
     catch (...)
     {
-        ::operator delete(block, std::align_val_t{align});
+        s.allocator.deallocate(block, size, align, storage.size_class);
         throw;
     }
 
@@ -275,6 +296,7 @@ domain::pending_allocation domain::begin_allocation(const detail::type_descripto
     header->object = static_cast<unsigned char*>(block) + offset;
     header->block_size = size;
     header->block_align = align;
+    header->size_class = storage.size_class;
     header->slot = index;
 
     ++s.construct_depth;
@@ -288,7 +310,7 @@ void domain::abort_allocation(pending_allocation& pending) noexcept
     --s.construct_depth;
     // The slot was never published; return it without bumping the generation.
     s.free_slots.push_back(h->slot);
-    ::operator delete(static_cast<void*>(h), std::align_val_t{h->block_align});
+    s.allocator.deallocate(h, h->block_size, h->block_align, h->size_class);
     pending.header = nullptr;
 }
 
@@ -448,7 +470,7 @@ void domain::reclaim(detail::object_header* h) noexcept
 
     --s.live_objects;
     s.live_bytes -= h->block_size;
-    ::operator delete(static_cast<void*>(h), std::align_val_t{h->block_align});
+    s.allocator.deallocate(h, h->block_size, h->block_align, h->size_class);
 }
 
 bool domain::enter_collection(bool& refused) noexcept

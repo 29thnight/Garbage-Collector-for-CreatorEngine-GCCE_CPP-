@@ -99,7 +99,7 @@ TEST(WeakRef, ManyReusesOfOneSlot)
 
 TEST(WeakRef, ConvertsToBase)
 {
-    struct base
+    struct base : gc::managed
     {
         int v = 5;
     };
@@ -119,7 +119,7 @@ TEST(WeakRef, ConvertsToBase)
 
 namespace
 {
-struct prober
+struct prober : gc::managed
 {
     static inline int promoted = 0;
     static inline int attempts = 0;

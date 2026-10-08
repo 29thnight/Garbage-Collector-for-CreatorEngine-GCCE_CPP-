@@ -163,7 +163,7 @@ TEST(Incremental, ObligationSetDuringMarkingIsNotMissed)
 
 namespace
 {
-struct big
+struct big : gc::managed
 {
     std::vector<gc::trace_ref<node>> refs;
     void gc_trace(gc::tracer& t) const { t.visit(refs); }
@@ -258,9 +258,10 @@ TEST(Incremental, CollectFullFinishesCycleInProgress)
 
 TEST(Incremental, StepFromDestructorIsRefused)
 {
-    struct steps_in_destructor
+    struct steps_in_destructor : gc::managed
     {
         gc::domain* d;
+        explicit steps_in_destructor(gc::domain* domain) : d(domain) {}
         ~steps_in_destructor() { EXPECT_TRUE(d->collect_step().refused); }
     };
 

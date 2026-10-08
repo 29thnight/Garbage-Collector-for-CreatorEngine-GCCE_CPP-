@@ -154,6 +154,8 @@ struct statistics
 
     // Memory and policy.
     std::size_t peak_live_bytes = 0;
+    std::size_t heap_committed_bytes = 0; // pages plus individually allocated large blocks
+    std::size_t heap_pages = 0;
     std::size_t memory_limit = 0;
     std::uint64_t allocations_over_limit = 0;
     std::size_t quarantined = 0;

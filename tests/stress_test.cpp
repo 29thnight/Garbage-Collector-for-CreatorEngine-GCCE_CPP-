@@ -18,7 +18,7 @@ namespace
 {
 // Node with an address registry so a reclaimed object can be told from a
 // live one without touching freed memory.
-struct tnode
+struct tnode : gc::managed
 {
     static inline std::unordered_set<const tnode*> registry;
     int id;

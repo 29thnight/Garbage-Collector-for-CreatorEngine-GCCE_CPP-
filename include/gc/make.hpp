@@ -1,5 +1,6 @@
 #pragma once
 
+#include "managed.hpp"
 #include "ref_from_this.hpp"
 #include "tracer.hpp"
 
@@ -41,12 +42,13 @@ const type_descriptor& descriptor_for()
 // A collection cannot start while a constructor runs. If the constructor
 // throws, the storage is released without running a destructor.
 //
-// The object is owned by the GC alone; never hand its address to
-// unique_ptr, shared_ptr or delete.
+// T must derive from gc::managed; the object is owned by the GC alone.
 template <class T, class... Args>
 [[nodiscard]] root_ref<T> make(domain& d, Args&&... args)
 {
     static_assert(std::is_object_v<T> && !std::is_array_v<T>, "gc::make: T must be a non-array object type");
+    static_assert(std::is_base_of_v<managed, T>,
+                  "gc::make: T must derive from gc::managed, which keeps new and delete away from GC objects");
     static_assert(std::is_nothrow_destructible_v<T>, "gc::make: destructors of GC objects must not throw");
 
     auto pending = detail::domain_access::begin_allocation(d, detail::descriptor_for<T>());

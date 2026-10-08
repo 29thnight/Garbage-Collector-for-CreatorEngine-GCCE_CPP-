@@ -27,6 +27,8 @@ add_executable(gcce_tests
     shutdown_test.cpp
     scenarios_test.cpp
     stress_test.cpp
+    managed_test.cpp
+    allocator_test.cpp
 )
 target_link_libraries(gcce_tests PRIVATE gcce::gcce GTest::gtest_main)
 
@@ -38,3 +40,23 @@ endif()
 
 include(GoogleTest)
 gtest_discover_tests(gcce_tests DISCOVERY_MODE PRE_TEST)
+
+# Compile-fail tests: each case must fail to build, and its control build
+# (the same file without the offending line) must succeed.
+set(GCCE_COMPILE_FAIL_CASES
+    new_expression array_new nothrow_new placement_new
+    delete_expression unique_ptr make_unmanaged)
+foreach(case IN LISTS GCCE_COMPILE_FAIL_CASES)
+    add_library(compile_fail_${case} OBJECT EXCLUDE_FROM_ALL compile_fail/${case}.cpp)
+    target_link_libraries(compile_fail_${case} PRIVATE gcce::gcce)
+    add_test(NAME CompileFail.${case}
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target compile_fail_${case} --config $<CONFIG>)
+    set_tests_properties(CompileFail.${case} PROPERTIES WILL_FAIL TRUE RESOURCE_LOCK gcce_build_tree)
+
+    add_library(compile_ok_${case} OBJECT EXCLUDE_FROM_ALL compile_fail/${case}.cpp)
+    target_link_libraries(compile_ok_${case} PRIVATE gcce::gcce)
+    target_compile_definitions(compile_ok_${case} PRIVATE GCCE_COMPILE_FAIL_CONTROL)
+    add_test(NAME CompileFail.${case}.control
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target compile_ok_${case} --config $<CONFIG>)
+    set_tests_properties(CompileFail.${case}.control PROPERTIES RESOURCE_LOCK gcce_build_tree)
+endforeach()
