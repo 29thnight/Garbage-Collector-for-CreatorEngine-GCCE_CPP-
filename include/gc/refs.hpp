@@ -23,6 +23,16 @@ struct ref_access
     template <class T> static T* raw(const trace_ref<T>& r) noexcept { return r.ptr_; }
 
     template <class T> static root_ref<T> make_root(object_header* h, T* p) { return root_ref<T>(h, p); }
+    // For gc::make: the object was just published on the owner thread, so
+    // the store checks and the barrier have nothing to do.
+    template <class T> static root_ref<T> adopt_new(object_header* h, T* p) noexcept
+    {
+        root_ref<T> r;
+        r.node_.header = h;
+        r.ptr_ = p;
+        domain_access::link_new_root(&r.node_);
+        return r;
+    }
     template <class T> static trace_ref<T> make_trace(object_header* h, T* p) { return trace_ref<T>(h, p); }
     template <class T> static weak_ref<T> make_weak(object_header* h, T* p) noexcept
     {

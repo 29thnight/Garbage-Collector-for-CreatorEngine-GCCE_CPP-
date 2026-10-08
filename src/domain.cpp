@@ -4,7 +4,17 @@
 
 #include "block_allocator.hpp"
 
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+#    include <intrin.h>
+#    define GCCE_PREFETCH(p) _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0)
+#elif defined(__GNUC__) || defined(__clang__)
+#    define GCCE_PREFETCH(p) __builtin_prefetch(p)
+#else
+#    define GCCE_PREFETCH(p) ((void)(p))
+#endif
+
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -38,8 +48,15 @@ enum class stage : std::uint8_t
 
 constexpr std::size_t default_allocation_threshold = std::size_t{4} * 1024 * 1024;
 constexpr std::uint32_t max_generation = std::numeric_limits<std::uint32_t>::max();
+// Objects popped from the gray stack wait this many traces in a ring while
+// their memory is prefetched, overlapping the cache misses of marking.
+constexpr std::size_t prefetch_depth = 8;
 // Slots looked at per verify or sweep unit when no destructor runs.
 constexpr std::size_t slot_scan_batch = 256;
+// collect_step reads the clock after this many units, or after a heavy one.
+constexpr std::size_t units_per_clock_check = 8;
+// A trace unit with more edges than this counts as heavy.
+constexpr std::size_t heavy_unit_edges = 256;
 constexpr const char* quarantine_label = "gc.quarantine";
 
 // vector::reserve sets the capacity exactly, so reserving one more element
@@ -104,6 +121,9 @@ struct domain::impl
     stage current_stage = stage::idle;
     std::uint32_t epoch = 0;
     std::vector<detail::object_header*> gray;
+    std::array<detail::object_header*, prefetch_depth> ring{};
+    std::size_t ring_head = 0;
+    std::size_t ring_count = 0;
     // Every object enters the gray stack at most once per cycle, so reserving
     // one entry per object that can be marked keeps pushes allocation-free.
     std::size_t gray_reserved = 0;
@@ -131,6 +151,10 @@ struct domain::impl
     bool in_collection = false;
     bool tracing = false;
     bool requested = false;
+    // Phase time is taken at boundaries (step start/end, reclaim decision,
+    // cycle end), not per unit: reading the clock costs as much as a unit.
+    clock::time_point phase_since{};
+    bool heavy_unit = false; // the last unit was large enough to check the clock
 
     // ---- statistics
     std::uint64_t cycles_completed = 0;
@@ -154,6 +178,33 @@ struct domain::impl
         : allocator(config.heap == heap_kind::system ? detail::pool_mode::system : detail::pool_mode::size_classes)
     {
         roots.prev = roots.next = &roots;
+    }
+
+    [[nodiscard]] bool gray_empty() const noexcept { return gray.empty() && ring_count == 0; }
+
+    void clear_gray() noexcept
+    {
+        gray.clear();
+        ring_count = 0;
+    }
+
+    // Next object to trace. Refills the ring from the gray stack first,
+    // prefetching each object's header and the start of its payload.
+    detail::object_header* next_gray() noexcept
+    {
+        while (ring_count < prefetch_depth && !gray.empty())
+        {
+            detail::object_header* h = gray.back();
+            gray.pop_back();
+            GCCE_PREFETCH(h);
+            GCCE_PREFETCH(reinterpret_cast<const char*>(h) + 64);
+            ring[(ring_head + ring_count) % prefetch_depth] = h;
+            ++ring_count;
+        }
+        detail::object_header* h = ring[ring_head];
+        ring_head = (ring_head + 1) % prefetch_depth;
+        --ring_count;
+        return h;
     }
 
     void note_unit(duration d, step_result& r) noexcept
@@ -207,7 +258,7 @@ void domain::report(violation_kind kind, const detail::object_header* header) no
 
 void domain::check_thread() noexcept
 {
-#if GC_THREAD_CHECKS
+#if GC_DEBUG_CHECKS
     if (std::this_thread::get_id() != impl_->owner)
         report(violation_kind::wrong_thread, nullptr);
 #endif
@@ -393,6 +444,16 @@ void domain::link_root(detail::root_node* node)
     ++s.root_count;
 }
 
+void domain::link_new_root(detail::root_node* node) noexcept
+{
+    impl& s = *impl_;
+    node->prev = &s.roots;
+    node->next = s.roots.next;
+    s.roots.next->prev = node;
+    s.roots.next = node;
+    ++s.root_count;
+}
+
 void domain::unlink_root(detail::root_node* node) noexcept
 {
     check_thread();
@@ -524,12 +585,13 @@ void domain::start_cycle()
     }
     s.current = collect_result{};
     s.cycle_start = clock::now();
+    s.phase_since = s.cycle_start;
     s.cycle_steps = 0;
     s.requested = false;
     s.bytes_since_last_cycle = 0;
     s.suspects.clear();
     s.verify_cursor = 0;
-    s.gray.clear();
+    s.clear_gray();
     s.gray_reserved = s.live_objects;
     reserve_at_least(s.gray, s.gray_reserved);
 
@@ -547,29 +609,29 @@ void domain::start_cycle()
 bool domain::do_unit(tracer& t, step_result& r)
 {
     impl& s = *impl_;
-    const auto t0 = clock::now();
+    (void)r;
+    s.heavy_unit = false;
     switch (s.current_stage)
     {
     case stage::trace:
-        if (!s.gray.empty())
+        if (!s.gray_empty())
         {
-            detail::object_header* h = s.gray.back();
-            s.gray.pop_back();
+            detail::object_header* h = s.next_gray();
             s.tracing = true;
             h->type->trace(h->object, t);
+            t.flush();
             s.tracing = false;
             ++s.current.marked;
-            s.current.edges_visited += std::exchange(t.edges_, 0);
-            const duration d = clock::now() - t0;
-            s.current.mark_time += d;
-            s.note_unit(d, r);
+            const std::size_t edges = std::exchange(t.edges_, 0);
+            s.current.edges_visited += edges;
+            s.heavy_unit = edges > heavy_unit_edges;
             return true;
         }
         s.current_stage = stage::verify;
         [[fallthrough]];
 
     case stage::verify:
-        if (!s.gray.empty())
+        if (!s.gray_empty())
         {
             // The barrier added work since the trace stage ran dry.
             s.current_stage = stage::trace;
@@ -584,9 +646,6 @@ bool domain::do_unit(tracer& t, step_result& r)
                 if (h && h->cleanup_obligation && !is_marked(h))
                     s.suspects.push_back(h);
             }
-            const duration d = clock::now() - t0;
-            s.current.mark_time += d;
-            s.note_unit(d, r);
             return true;
         }
         finalize(t, r);
@@ -603,11 +662,6 @@ bool domain::do_unit(tracer& t, step_result& r)
                 ++s.current.reclaimed;
                 break; // at most one destructor per unit
             }
-        }
-        {
-            const duration d = clock::now() - t0;
-            s.current.sweep_time += d;
-            s.note_unit(d, r);
         }
         if (s.sweep_cursor < s.sweep_end)
             return true;
@@ -629,11 +683,11 @@ void domain::finalize(tracer& t, step_result& r)
     const auto t0 = clock::now();
 
     s.tracing = true;
-    while (!s.gray.empty())
+    while (!s.gray_empty())
     {
-        detail::object_header* h = s.gray.back();
-        s.gray.pop_back();
+        detail::object_header* h = s.next_gray();
         h->type->trace(h->object, t);
+        t.flush();
         ++s.current.marked;
     }
     s.tracing = false;
@@ -659,12 +713,14 @@ void domain::finalize(tracer& t, step_result& r)
     }
     s.suspects.clear();
 
-    const duration elapsed = clock::now() - t0;
-    s.current.mark_time += elapsed;
+    const auto finalize_end = clock::now();
+    const duration elapsed = finalize_end - t0;
+    s.current.mark_time += finalize_end - s.phase_since;
+    s.phase_since = finalize_end;
     r.finalized = true;
     r.finalize_time = elapsed;
     s.worst_finalize = std::max(s.worst_finalize, elapsed);
-    s.note_unit(elapsed, r);
+    s.heavy_unit = true; // the decision can be long: check the budget after it
 
     if (s.current.violations != 0)
     {
@@ -683,9 +739,11 @@ void domain::finish_cycle(bool completed)
 {
     impl& s = *impl_;
     const auto now = clock::now();
+    if (completed)
+        s.current.sweep_time += now - s.phase_since;
     phase_ = phase::idle;
     s.current_stage = stage::idle;
-    s.gray.clear();
+    s.clear_gray();
     s.suspects.clear();
 
     s.current.completed = completed;
@@ -753,21 +811,51 @@ step_result domain::collect_step(const step_budget& budget)
 
     ++s.steps;
     ++s.cycle_steps;
+    if (!r.cycle_started)
+        s.phase_since = start; // resume phase accounting; mutator time is excluded
     tracer t(*this);
+    auto last_check = start;
+    std::size_t since_check = 0;
+    auto check_clock = [&] {
+        const auto now = clock::now();
+        s.note_unit(now - last_check, r);
+        last_check = now;
+        since_check = 0;
+        return now;
+    };
     for (;;)
     {
         const bool more = do_unit(t, r);
         ++r.units;
+        ++since_check;
         if (!more)
         {
             r.cycle_finished = true;
+            check_clock();
             break;
         }
-        if (r.units >= min_units && clock::now() - start >= time_budget)
+        const bool check = s.heavy_unit || since_check >= units_per_clock_check;
+        if (r.units < min_units)
+        {
+            if (check)
+                check_clock();
+            continue;
+        }
+        if (time_budget <= duration::zero())
+        {
+            check_clock();
+            break;
+        }
+        if (check && check_clock() - start >= time_budget)
             break;
     }
 
-    r.elapsed = clock::now() - start;
+    const auto end = clock::now();
+    if (phase_ == phase::marking)
+        s.current.mark_time += end - s.phase_since;
+    else if (phase_ == phase::sweeping)
+        s.current.sweep_time += end - s.phase_since;
+    r.elapsed = end - start;
     r.over_budget = r.elapsed > time_budget;
     s.steps_over_budget += r.over_budget;
     s.worst_step = std::max(s.worst_step, r.elapsed);
@@ -789,7 +877,10 @@ collect_result domain::collect_full()
     }
 
     if (phase_ != phase::idle)
+    {
+        s.phase_since = clock::now();
         run_to_cycle_end();
+    }
     start_cycle();
     run_to_cycle_end();
 

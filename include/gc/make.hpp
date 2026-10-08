@@ -64,6 +64,6 @@ template <class T, class... Args>
     }
     detail::managed_access::set_header(*static_cast<managed*>(object), pending.header);
     detail::object_header* header = detail::domain_access::publish(d, pending);
-    return detail::ref_access::make_root<T>(header, object);
+    return detail::ref_access::adopt_new<T>(header, object);
 }
 } // namespace gc

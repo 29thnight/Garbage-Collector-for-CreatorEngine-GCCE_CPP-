@@ -8,7 +8,7 @@
 using gctest::live;
 using gctest::node;
 
-#if GC_THREAD_CHECKS
+#if GC_DEBUG_CHECKS
 // Root registration and reference stores belong to the owner thread.
 TEST(Threading, RegistryChangesOffTheOwnerThreadAreReported)
 {

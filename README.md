@@ -155,7 +155,7 @@ ctest --test-dir build --output-on-failure
 | 옵션 | 기본값 | 의미 |
 | --- | --- | --- |
 | `GCCE_BUILD_SHARED` | OFF | 런타임을 DLL/공유 라이브러리로 빌드 |
-| `GCCE_THREAD_CHECKS` | ON | owner 스레드 검사 |
+| `GCCE_DEBUG_CHECKS` | AUTO | owner 스레드 검사와 잘못된 사용 탐지. AUTO는 Debug에서 켜고 Release에서 끈다 |
 | `GCCE_BUILD_TESTS` | ON | GoogleTest 테스트 빌드 |
 | `GCCE_BUILD_BENCHMARKS` | OFF | 힙 비교 벤치마크 빌드 |
 

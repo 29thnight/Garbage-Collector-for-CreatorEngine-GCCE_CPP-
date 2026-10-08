@@ -16,13 +16,15 @@
 #    define GC_API
 #endif
 
-// Owner-thread checks for root registration, reference stores, allocation and
-// collection. Enabled by default in debug builds.
-#if !defined(GC_THREAD_CHECKS)
+// Debug checks: owner-thread checks for root registration, reference
+// stores, allocation and collection, and detection of misuse (roots inside GC
+// objects, GC types created outside gc::make, weak references that outlive
+// their domain). On by default in debug builds, off in release builds.
+#if !defined(GC_DEBUG_CHECKS)
 #    if defined(NDEBUG)
-#        define GC_THREAD_CHECKS 0
+#        define GC_DEBUG_CHECKS 0
 #    else
-#        define GC_THREAD_CHECKS 1
+#        define GC_DEBUG_CHECKS 1
 #    endif
 #endif
 

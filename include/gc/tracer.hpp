@@ -2,6 +2,7 @@
 
 #include "refs.hpp"
 
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -10,6 +11,10 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+#    include <xmmintrin.h>
+#endif
 
 namespace gc
 {
@@ -38,6 +43,17 @@ template <class... Ts>
 consteval bool any_traceable(std::variant<Ts...>*)
 {
     return (traceable<Ts>() || ...);
+}
+
+inline void prefetch(const void* p) noexcept
+{
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(p);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(static_cast<const char*>(p), _MM_HINT_T0);
+#else
+    (void)p;
+#endif
 }
 
 template <class T>
@@ -135,18 +151,35 @@ private:
     // Diagnostic mode: records edges instead of marking.
     tracer(domain& d, std::vector<detail::object_header*>& edges) noexcept : domain_(d), collect_(&edges) {}
 
+    // Edges are marked in small batches: each target header is prefetched
+    // when it is found and marked when the batch is flushed, so the cache
+    // misses of one object's edges overlap.
     void mark(detail::object_header* header)
     {
         if (!header)
             return;
         ++edges_;
         if (collect_)
+        {
             collect_->push_back(header);
-        else
-            domain_.shade(header);
+            return;
+        }
+        detail::prefetch(header);
+        pending_[pending_count_++] = header;
+        if (pending_count_ == pending_.size())
+            flush();
+    }
+
+    void flush()
+    {
+        for (std::size_t i = 0; i < pending_count_; ++i)
+            domain_.shade(pending_[i]);
+        pending_count_ = 0;
     }
 
     domain& domain_;
+    std::array<detail::object_header*, 16> pending_{};
+    std::size_t pending_count_ = 0;
     std::vector<detail::object_header*>* collect_ = nullptr;
     std::size_t edges_ = 0;
 };

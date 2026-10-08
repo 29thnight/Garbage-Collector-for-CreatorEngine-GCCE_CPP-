@@ -247,6 +247,7 @@ private:
 
     void on_store(detail::object_header* target);
     void link_root(detail::root_node* node);
+    void link_new_root(detail::root_node* node) noexcept;
     void unlink_root(detail::root_node* node) noexcept;
     [[nodiscard]] detail::object_header* resolve_weak(std::uint32_t slot, std::uint32_t generation);
 
@@ -291,6 +292,7 @@ struct domain_access
 
     static void on_store(object_header* target) { target->owner->on_store(target); }
     static void link_root(root_node* node) { node->header->owner->link_root(node); }
+    static void link_new_root(root_node* node) noexcept { node->header->owner->link_new_root(node); }
     static void unlink_root(root_node* node) noexcept { node->header->owner->unlink_root(node); }
     static object_header* resolve_weak(domain& d, std::uint32_t slot, std::uint32_t generation)
     {
