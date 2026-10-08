@@ -42,6 +42,15 @@ constexpr std::uint32_t max_generation = std::numeric_limits<std::uint32_t>::max
 constexpr std::size_t slot_scan_batch = 256;
 constexpr const char* quarantine_label = "gc.quarantine";
 
+// vector::reserve sets the capacity exactly, so reserving one more element
+// at a time reallocates every time. Grow geometrically instead.
+template <class T>
+void reserve_at_least(std::vector<T>& v, std::size_t n)
+{
+    if (n > v.capacity())
+        v.reserve(std::max(n, v.capacity() * 2));
+}
+
 std::size_t round_up(std::size_t value, std::size_t align) noexcept
 {
     return (value + align - 1) / align * align;
@@ -141,7 +150,13 @@ struct domain::impl
 
     violation_handler handler = &default_violation_handler;
 
-    impl() noexcept { roots.prev = roots.next = &roots; }
+    explicit impl(const domain_config& config)
+        : allocator(config.heap == heap_kind::system           ? detail::pool_mode::system
+                    : config.heap == heap_kind::per_type_pools ? detail::pool_mode::per_type
+                                                               : detail::pool_mode::size_classes)
+    {
+        roots.prev = roots.next = &roots;
+    }
 
     void note_unit(duration d, step_result& r) noexcept
     {
@@ -150,7 +165,9 @@ struct domain::impl
     }
 };
 
-domain::domain() : impl_(std::make_unique<impl>()) {}
+domain::domain() : domain(domain_config{}) {}
+
+domain::domain(const domain_config& config) : impl_(std::make_unique<impl>(config)) {}
 
 domain::~domain()
 {
@@ -244,6 +261,7 @@ statistics domain::stats() const
     st.peak_live_bytes = s.peak_live_bytes;
     st.heap_committed_bytes = s.allocator.committed_bytes();
     st.heap_pages = s.allocator.page_count();
+    st.heap_chunks = s.allocator.chunk_count();
     st.memory_limit = s.pacing_config.memory_limit;
     st.allocations_over_limit = s.allocations_over_limit;
     st.quarantined = s.quarantine.size();
@@ -263,7 +281,7 @@ domain::pending_allocation domain::begin_allocation(const detail::type_descripto
     const std::size_t offset = round_up(sizeof(detail::object_header), type.align);
     const std::size_t size = offset + type.size;
 
-    const detail::block_allocator::allocation storage = s.allocator.allocate(size, align);
+    const detail::block_allocator::allocation storage = s.allocator.allocate(size, align, &type);
     void* block = storage.block;
 
     std::uint32_t index;
@@ -278,15 +296,15 @@ domain::pending_allocation domain::begin_allocation(const detail::type_descripto
         {
             s.slots.emplace_back();
             // Reserve so that releasing a slot during sweep never allocates.
-            s.free_slots.reserve(s.slots.size());
+            reserve_at_least(s.free_slots, s.slots.size());
             index = static_cast<std::uint32_t>(s.slots.size() - 1);
         }
         if (phase_ == phase::marking)
-            s.gray.reserve(++s.gray_reserved);
+            reserve_at_least(s.gray, ++s.gray_reserved);
     }
     catch (...)
     {
-        s.allocator.deallocate(block, size, align, storage.size_class);
+        s.allocator.deallocate(block, size, align, storage.pool);
         throw;
     }
 
@@ -296,7 +314,7 @@ domain::pending_allocation domain::begin_allocation(const detail::type_descripto
     header->object = static_cast<unsigned char*>(block) + offset;
     header->block_size = size;
     header->block_align = align;
-    header->size_class = storage.size_class;
+    header->pool = storage.pool;
     header->slot = index;
 
     ++s.construct_depth;
@@ -310,7 +328,7 @@ void domain::abort_allocation(pending_allocation& pending) noexcept
     --s.construct_depth;
     // The slot was never published; return it without bumping the generation.
     s.free_slots.push_back(h->slot);
-    s.allocator.deallocate(h, h->block_size, h->block_align, h->size_class);
+    s.allocator.deallocate(h, h->block_size, h->block_align, h->pool);
     pending.header = nullptr;
 }
 
@@ -470,7 +488,7 @@ void domain::reclaim(detail::object_header* h) noexcept
 
     --s.live_objects;
     s.live_bytes -= h->block_size;
-    s.allocator.deallocate(h, h->block_size, h->block_align, h->size_class);
+    s.allocator.deallocate(h, h->block_size, h->block_align, h->pool);
 }
 
 bool domain::enter_collection(bool& refused) noexcept
@@ -515,7 +533,7 @@ void domain::start_cycle()
     s.verify_cursor = 0;
     s.gray.clear();
     s.gray_reserved = s.live_objects;
-    s.gray.reserve(s.gray_reserved);
+    reserve_at_least(s.gray, s.gray_reserved);
 
     phase_ = phase::marking;
     s.current_stage = stage::trace;
@@ -682,6 +700,7 @@ void domain::finish_cycle(bool completed)
     s.last_cycle_wall = now - s.cycle_start;
     s.last_cycle_steps = s.cycle_steps;
     s.last_cycle_end = now;
+    s.allocator.end_cycle();
 }
 
 void domain::run_to_cycle_end()

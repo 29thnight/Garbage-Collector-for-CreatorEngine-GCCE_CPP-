@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <unordered_set>
 #include <vector>
@@ -67,10 +68,114 @@ TEST(Allocator, EmptyPagesAreReturned)
 
     keep.clear();
     d.collect_full();
-    // At most one page with free space is kept per size class.
-    EXPECT_LE(d.stats().heap_pages, 1u);
+    EXPECT_EQ(d.stats().heap_pages, 0u);
     EXPECT_EQ(live(d), 0u);
 }
+
+// Freed pages stay committed for reuse, then give their physical memory back
+// after staying idle for two cycles; idle chunks are unmapped.
+TEST(Allocator, MemoryGoesBackToTheOs)
+{
+    gc::domain d;
+    std::vector<gc::root_ref<node>> keep;
+    for (int i = 0; i < 50000; ++i)
+        keep.push_back(gc::make<node>(d, i));
+    const auto full = d.stats();
+    ASSERT_GT(full.heap_chunks, 1u);
+
+    keep.clear();
+    d.collect_full();
+    EXPECT_EQ(d.stats().heap_pages, 0u);
+    EXPECT_GE(d.stats().heap_committed_bytes, full.heap_committed_bytes / 2); // kept warm for reuse
+
+    d.collect_full();
+    d.collect_full();
+    const auto after = d.stats();
+    EXPECT_LE(after.heap_committed_bytes, 8u * page);
+    EXPECT_LE(after.heap_chunks, 1u);
+    EXPECT_LT(after.heap_committed_bytes, full.heap_committed_bytes / 10);
+}
+
+// An emptied page is not tied to its size class.
+TEST(Allocator, EmptyPagesServeOtherSizes)
+{
+    gc::domain d;
+    std::vector<gc::root_ref<gc::managed>> keep;
+    for (int i = 0; i < 20000; ++i)
+        keep.push_back(gc::make<sized<40>>(d));
+    const auto chunks_small = d.stats().heap_chunks;
+    keep.clear();
+    d.collect_full();
+
+    for (int i = 0; i < 2000; ++i)
+        keep.push_back(gc::make<sized<400>>(d));
+    EXPECT_LE(d.stats().heap_chunks, chunks_small);
+}
+
+namespace
+{
+struct payload_node : gc::managed
+{
+    gc::trace_ref<payload_node> next;
+    std::uint32_t pattern;
+    unsigned char bytes[200];
+    explicit payload_node(std::uint32_t p) : pattern(p) { std::memset(bytes, static_cast<int>(p & 0xFF), sizeof(bytes)); }
+    bool intact() const
+    {
+        for (unsigned char b : bytes)
+            if (b != static_cast<unsigned char>(pattern & 0xFF))
+                return false;
+        return true;
+    }
+    void gc_trace(gc::tracer& t) const { t.visit(next); }
+};
+
+class HeapKinds : public ::testing::TestWithParam<gc::heap_kind>
+{
+};
+} // namespace
+
+// The same workload on every heap: objects keep their contents across
+// collections, and live counts match.
+TEST_P(HeapKinds, WorkloadKeepsObjectsIntact)
+{
+    gc::domain d(gc::domain_config{GetParam()});
+    std::mt19937 rng(11);
+    std::vector<gc::root_ref<payload_node>> keep;
+    std::uint32_t next_pattern = 1;
+    for (int round = 0; round < 30; ++round)
+    {
+        for (int i = 0; i < 2000; ++i)
+        {
+            auto n = gc::make<payload_node>(d, next_pattern++);
+            if (rng() % 4 == 0)
+                keep.push_back(n);
+            else if (!keep.empty())
+                keep[rng() % keep.size()]->next = n;
+        }
+        std::shuffle(keep.begin(), keep.end(), rng);
+        keep.resize(keep.size() * 2 / 3);
+        d.request_collection();
+        while (!d.collect_step({gc::duration::zero(), 128}).cycle_finished)
+        {
+        }
+        for (const auto& k : keep)
+        {
+            ASSERT_TRUE(k->intact());
+            if (k->next)
+            {
+                ASSERT_TRUE(k->next->intact());
+            }
+        }
+    }
+    keep.clear();
+    d.collect_full();
+    EXPECT_EQ(live(d), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(All, HeapKinds,
+                         ::testing::Values(gc::heap_kind::size_class_pools, gc::heap_kind::per_type_pools,
+                                           gc::heap_kind::system));
 
 TEST(Allocator, MixedSizesAndLargeObjects)
 {

@@ -24,7 +24,7 @@ jobs:
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: cmake -S . -B build -DGCCE_BUILD_SHARED=${{ matrix.shared }}
+        run: cmake -S . -B build -DGCCE_BUILD_SHARED=${{ matrix.shared }} -DGCCE_BUILD_BENCHMARKS=ON
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
@@ -32,7 +32,7 @@ jobs:
           CXX=${{ matrix.compiler == 'clang' && 'clang++-18' || 'g++-14' }}
           FLAGS="${{ matrix.sanitize && '-fsanitize=address,undefined -fno-omit-frame-pointer' || '' }}"
           cmake -S . -B build -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_BUILD_TYPE=${{ matrix.config }} \
-                -DGCCE_BUILD_SHARED=${{ matrix.shared }} -DCMAKE_CXX_FLAGS="$FLAGS"
+                -DGCCE_BUILD_SHARED=${{ matrix.shared }} -DCMAKE_CXX_FLAGS="$FLAGS" -DGCCE_BUILD_BENCHMARKS=ON
 
       - name: Build
         run: cmake --build build --config ${{ matrix.config }}
@@ -42,3 +42,15 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+
+      - name: Heap benchmark
+        # Informational: compares size-class pools, per-type pools and the
+        # system allocator on this runner. Shared runners are noisy.
+        if: matrix.config == 'Release'
+        shell: bash
+        run: |
+          bin=build/bin
+          [ -d build/bin/Release ] && bin=build/bin/Release
+          "$bin/gcce_allocator_bench" 0.5
+          for heap in class type system; do "$bin/gcce_bench" $heap 0.5; done
+          for heap in class type system; do "$bin/gcce_bench" $heap 0.02 many-types; done

@@ -4,6 +4,7 @@ project(gcce VERSION 0.1.0 LANGUAGES CXX)
 option(GCCE_BUILD_SHARED "Build the GC runtime as a shared library (DLL)" OFF)
 option(GCCE_BUILD_TESTS "Build the test suite" ON)
 option(GCCE_THREAD_CHECKS "Report registry and graph changes off the owner thread" ON)
+option(GCCE_BUILD_BENCHMARKS "Build the heap comparison benchmark" OFF)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +33,18 @@ if(MSVC)
     target_compile_options(gcce PRIVATE /W4 /permissive-)
 else()
     target_compile_options(gcce PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(GCCE_BUILD_BENCHMARKS)
+    add_executable(gcce_bench bench/gcce_bench.cpp)
+    target_link_libraries(gcce_bench PRIVATE gcce::gcce)
+    if(WIN32)
+        target_link_libraries(gcce_bench PRIVATE psapi)
+    endif()
+
+    # Builds the allocator source directly: it is internal to the library.
+    add_executable(gcce_allocator_bench bench/allocator_bench.cpp src/block_allocator.cpp)
+    target_include_directories(gcce_allocator_bench PRIVATE src)
 endif()
 
 if(GCCE_BUILD_TESTS)

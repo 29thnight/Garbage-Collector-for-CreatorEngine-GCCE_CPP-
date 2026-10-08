@@ -117,6 +117,22 @@ struct pacing
     double max_budget_scale = 8.0;
 };
 
+// Where GC blocks come from. Blocks up to 2 KiB come from 64 KiB pages in
+// OS-backed chunks, pooled either by size class (default: 24 classes shared by
+// all types) or per type (exact size, one pool per type). system sends every
+// block to the global operator new. The alternatives exist for comparison.
+enum class heap_kind : std::uint8_t
+{
+    size_class_pools,
+    per_type_pools,
+    system
+};
+
+struct domain_config
+{
+    heap_kind heap = heap_kind::size_class_pools;
+};
+
 // Diagnostic description of a GC object or root.
 struct object_info
 {
@@ -155,7 +171,8 @@ struct statistics
     // Memory and policy.
     std::size_t peak_live_bytes = 0;
     std::size_t heap_committed_bytes = 0; // pages plus individually allocated large blocks
-    std::size_t heap_pages = 0;
+    std::size_t heap_pages = 0;  // pages assigned to a pool
+    std::size_t heap_chunks = 0; // 2 MiB OS chunks mapped
     std::size_t memory_limit = 0;
     std::uint64_t allocations_over_limit = 0;
     std::size_t quarantined = 0;
@@ -174,6 +191,7 @@ class GC_API domain
 {
 public:
     domain();
+    explicit domain(const domain_config& config);
     ~domain();
 
     domain(const domain&) = delete;
