@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.config }} shared=${{ matrix.shared }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # M1 gate: product MSVC, Debug and Release, static and DLL.
+          - { os: windows-latest, compiler: msvc, config: Debug, shared: OFF }
+          - { os: windows-latest, compiler: msvc, config: Release, shared: OFF }
+          - { os: windows-latest, compiler: msvc, config: Debug, shared: ON }
+          - { os: windows-latest, compiler: msvc, config: Release, shared: ON }
+          - { os: ubuntu-latest, compiler: gcc, config: Debug, shared: OFF, sanitize: true }
+          - { os: ubuntu-latest, compiler: clang, config: Release, shared: ON }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -DGCCE_BUILD_SHARED=${{ matrix.shared }}
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          CXX=${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+          FLAGS="${{ matrix.sanitize && '-fsanitize=address,undefined -fno-omit-frame-pointer' || '' }}"
+          cmake -S . -B build -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_BUILD_TYPE=${{ matrix.config }} \
+                -DGCCE_BUILD_SHARED=${{ matrix.shared }} -DCMAKE_CXX_FLAGS="$FLAGS"
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }}
+
+      - name: Test
+        # Two shutdown tests leak objects on purpose to show the unsupported path.
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
