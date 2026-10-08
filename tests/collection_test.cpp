@@ -163,6 +163,10 @@ TEST(Collection, VirtualInheritance)
     EXPECT_EQ(base->shared->id, 1);
 }
 
+#if defined(_MSC_VER)
+#    pragma warning(push)
+#    pragma warning(disable : 4324) // padding from alignas is the point of these types
+#endif
 namespace
 {
 struct alignas(64) cache_line
@@ -177,6 +181,9 @@ struct empty
 {
 };
 } // namespace
+#if defined(_MSC_VER)
+#    pragma warning(pop)
+#endif
 
 TEST(Collection, AlignmentAndSize)
 {
