@@ -44,13 +44,13 @@ jobs:
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
 
       - name: Heap benchmark
-        # Informational: compares size-class pools, per-type pools and the
-        # system allocator on this runner. Shared runners are noisy.
+        # Informational: compares the size-class pools with the system
+        # allocator on this runner. Shared runners are noisy.
         if: matrix.config == 'Release'
         shell: bash
         run: |
           bin=build/bin
           [ -d build/bin/Release ] && bin=build/bin/Release
           "$bin/gcce_allocator_bench" 0.5
-          for heap in class type system; do "$bin/gcce_bench" $heap 0.5; done
-          for heap in class type system; do "$bin/gcce_bench" $heap 0.02 many-types; done
+          for heap in class system; do "$bin/gcce_bench" $heap 0.5; done
+          for heap in class system; do "$bin/gcce_bench" $heap 0.02 many-types; done

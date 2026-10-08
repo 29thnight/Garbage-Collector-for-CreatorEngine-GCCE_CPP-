@@ -174,8 +174,7 @@ TEST_P(HeapKinds, WorkloadKeepsObjectsIntact)
 }
 
 INSTANTIATE_TEST_SUITE_P(All, HeapKinds,
-                         ::testing::Values(gc::heap_kind::size_class_pools, gc::heap_kind::per_type_pools,
-                                           gc::heap_kind::system));
+                         ::testing::Values(gc::heap_kind::size_class_pools, gc::heap_kind::system));
 
 TEST(Allocator, MixedSizesAndLargeObjects)
 {

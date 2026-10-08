@@ -266,19 +266,6 @@ void block_allocator::unmap_chunk(chunk* c) noexcept
     delete c;
 }
 
-int block_allocator::pool_for(std::size_t size, const void* type_key)
-{
-    if (mode_ == pool_mode::size_classes)
-    {
-        return class_lookup[(size + 15) / 16];
-    }
-    // per_type: one pool per type, block size rounded to the 16-byte grid.
-    auto [it, inserted] = type_pools_.try_emplace(type_key, static_cast<std::uint16_t>(pools_.size()));
-    if (inserted)
-        pools_.push_back({(size + small_align - 1) / small_align * small_align, nullptr});
-    return it->second;
-}
-
 block_allocator::page* block_allocator::new_page(std::uint16_t pool)
 {
     // Prefer an idle page that still holds physical memory.
@@ -372,7 +359,7 @@ void block_allocator::end_cycle() noexcept
     }
 }
 
-block_allocator::allocation block_allocator::allocate(std::size_t size, std::size_t align, const void* type_key)
+block_allocator::allocation block_allocator::allocate(std::size_t size, std::size_t align)
 {
     if (mode_ == pool_mode::system && align <= __STDCPP_DEFAULT_NEW_ALIGNMENT__)
     {
@@ -387,7 +374,7 @@ block_allocator::allocation block_allocator::allocate(std::size_t size, std::siz
         return {block, large_class};
     }
 
-    const auto pool = static_cast<std::uint16_t>(pool_for(size, type_key));
+    const std::uint16_t pool = class_lookup[(size + small_align - 1) / small_align];
     pool_state& state = pools_[pool];
     page* p = state.available ? state.available : new_page(pool);
 

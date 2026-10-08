@@ -34,14 +34,12 @@ struct block
     std::uint16_t pool;
 };
 
-// One type key per block size stands in for one type per size.
-template <gc::detail::pool_mode Mode>
 struct pool_heap
 {
-    gc::detail::block_allocator a{Mode};
+    gc::detail::block_allocator a;
     block alloc(std::size_t size)
     {
-        auto r = a.allocate(size, 8, reinterpret_cast<const void*>(size));
+        auto r = a.allocate(size, 8);
         return {r.block, size, r.pool};
     }
     void free(const block& b) { a.deallocate(b.p, b.size, 8, b.pool); }
@@ -107,8 +105,7 @@ int main(int argc, char** argv)
     std::printf("== allocator only, %zu blocks, 5 rounds\n", n);
     for (int round = 0; round < 2; ++round)
     {
-        run<pool_heap<gc::detail::pool_mode::size_classes>>("class", n, 7);
-        run<pool_heap<gc::detail::pool_mode::per_type>>("type", n, 7);
+        run<pool_heap>("class", n, 7);
         run<system_heap>("system", n, 7);
     }
     return 0;

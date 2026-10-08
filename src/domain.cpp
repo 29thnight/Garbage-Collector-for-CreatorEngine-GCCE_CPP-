@@ -151,9 +151,7 @@ struct domain::impl
     violation_handler handler = &default_violation_handler;
 
     explicit impl(const domain_config& config)
-        : allocator(config.heap == heap_kind::system           ? detail::pool_mode::system
-                    : config.heap == heap_kind::per_type_pools ? detail::pool_mode::per_type
-                                                               : detail::pool_mode::size_classes)
+        : allocator(config.heap == heap_kind::system ? detail::pool_mode::system : detail::pool_mode::size_classes)
     {
         roots.prev = roots.next = &roots;
     }
@@ -281,7 +279,7 @@ domain::pending_allocation domain::begin_allocation(const detail::type_descripto
     const std::size_t offset = round_up(sizeof(detail::object_header), type.align);
     const std::size_t size = offset + type.size;
 
-    const detail::block_allocator::allocation storage = s.allocator.allocate(size, align, &type);
+    const detail::block_allocator::allocation storage = s.allocator.allocate(size, align);
     void* block = storage.block;
 
     std::uint32_t index;

@@ -117,14 +117,13 @@ struct pacing
     double max_budget_scale = 8.0;
 };
 
-// Where GC blocks come from. Blocks up to 2 KiB come from 64 KiB pages in
-// OS-backed chunks, pooled either by size class (default: 24 classes shared by
-// all types) or per type (exact size, one pool per type). system sends every
-// block to the global operator new. The alternatives exist for comparison.
+// Where GC blocks come from. size_class_pools (default): blocks up to 2 KiB
+// come from 64 KiB pages in OS-backed chunks, pooled by 24 size classes
+// shared by all types. system sends every block to the global operator new
+// and exists for comparison.
 enum class heap_kind : std::uint8_t
 {
     size_class_pools,
-    per_type_pools,
     system
 };
 

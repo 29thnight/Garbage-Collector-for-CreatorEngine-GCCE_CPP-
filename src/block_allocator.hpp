@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <unordered_map>
 #include <vector>
 
 namespace gc::detail
@@ -22,14 +21,12 @@ namespace gc::detail
 //   - a chunk whose pages are all idle and decommitted is unmapped, unless
 //     it is the only chunk with free pages.
 //
-// Pools are keyed either by size class (24 classes up to 2 KiB, shared by
-// every type of that size) or by type (one pool per type, exact block size).
-// Blocks above 2 KiB, or with alignment above 16, use the global operator
-// new, and so does every block in system mode.
+// Pools are size classes: 24 classes up to 2 KiB, shared by every type of
+// that size. Blocks above 2 KiB, or with alignment above 16, use the global
+// operator new, and so does every block in system mode.
 enum class pool_mode : std::uint8_t
 {
     size_classes,
-    per_type,
     system
 };
 
@@ -58,9 +55,8 @@ public:
     block_allocator(const block_allocator&) = delete;
     block_allocator& operator=(const block_allocator&) = delete;
 
-    // `type_key` identifies the type in per-type mode and is ignored
-    // otherwise. Throws std::bad_alloc.
-    allocation allocate(std::size_t size, std::size_t align, const void* type_key);
+    // Throws std::bad_alloc.
+    allocation allocate(std::size_t size, std::size_t align);
     void deallocate(void* block, std::size_t size, std::size_t align, std::uint16_t pool) noexcept;
 
     // Called at the end of each collection cycle: returns long-idle pages
@@ -86,7 +82,6 @@ private:
         page* available = nullptr; // pages with at least one free block
     };
 
-    int pool_for(std::size_t size, const void* type_key);
     page* new_page(std::uint16_t pool);
     void release_page(page* p) noexcept;
     chunk* map_chunk();
@@ -97,7 +92,6 @@ private:
     void push_chunk(chunk* c) noexcept;
 
     std::vector<pool_state> pools_;
-    std::unordered_map<const void*, std::uint16_t> type_pools_; // per-type mode
     std::vector<chunk*> chunks_;          // every mapped chunk
     chunk* chunks_with_free_ = nullptr;   // chunks that have at least one free page
     std::size_t pages_in_use_ = 0;

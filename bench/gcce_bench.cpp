@@ -2,7 +2,6 @@
 // same collector. Run one process per heap so memory figures do not mix:
 //
 //     gcce_bench class  [scale]   size-class pools (default heap)
-//     gcce_bench type   [scale]   one pool per type
 //     gcce_bench system [scale]   global operator new
 //
 // scale (default 1.0) multiplies object counts.
@@ -317,8 +316,6 @@ void many_types_scenario(const options& o)
 int main(int argc, char** argv)
 {
     options o{gc::heap_kind::size_class_pools, "class", 1.0, false};
-    if (argc > 1 && std::strcmp(argv[1], "type") == 0)
-        o = {gc::heap_kind::per_type_pools, "type", 1.0, false};
     if (argc > 1 && std::strcmp(argv[1], "system") == 0)
         o = {gc::heap_kind::system, "system", 1.0, false};
     if (argc > 2)
