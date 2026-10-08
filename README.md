@@ -72,7 +72,7 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 
 ### 힙 비교 결과
 
-`-DGCCE_BUILD_BENCHMARKS=ON`으로 `gcce_allocator_bench`(할당자 단독)와 `gcce_bench`(GC 전체)를 빌드한다. 아래는 Linux x86-64, GCC 14 Release, glibc malloc 기준 수치다. CI의 Release job도 같은 벤치마크를 실행해 MSVC 힙 기준 수치를 로그에 남긴다.
+`-DGCCE_BUILD_BENCHMARKS=ON`으로 `gcce_allocator_bench`(할당자 단독)와 `gcce_bench`(GC 전체)를 빌드한다. 아래는 Linux x86-64, GCC 14 Release, glibc malloc 기준 수치다. CI의 Release job도 같은 벤치마크를 실행해 로그에 남긴다.
 
 할당자 단독(100만 블록, 실제 GC 블록 크기 분포, ns/op):
 
@@ -90,6 +90,16 @@ GC 전체:
 | Mark (ns/객체, 50만 개 생존 그래프) | 409 | 414 | 460 |
 | 프레임 churn p50 / p99 (ms, 20만 개 생존, 프레임당 3000개 할당) | 3.85 / 5.41 | 3.86 / 5.03 | 4.78 / 6.18 |
 | 프레임 churn 종료 시 RSS | 127 MiB | 122 MiB | 272 MiB |
+| 200개 타입, 6000개 객체의 commit | 3.2 MiB | 12.7 MiB | 2.6 MiB |
+
+Windows(GitHub Actions `windows-latest`, MSVC Release, 기본 힙, 절반 규모):
+
+| 시나리오 | 크기 클래스 | 타입별 | 시스템 |
+| --- | --- | --- | --- |
+| 할당자 단독: 할당 / 무작위 해제 / 재할당 / 전체 해제 (ns/op) | 8 / 49 / 63 / 16 | 26 / 58 / 92 / 16 | 96 / 140 / 138 / 107 |
+| GC 할당 / 회수 (ns/객체) | 84 / 112 | 107 / 113 | 218 / 193 |
+| Mark (ns/객체) | 204 | 219 | 220 |
+| 프레임 churn p50 / p99 (ms) | 1.80 / 2.48 | 1.86 / 2.52 | 2.01 / 2.61 |
 | 200개 타입, 6000개 객체의 commit | 3.2 MiB | 12.7 MiB | 2.6 MiB |
 
 - **기본값 판단:** 크기 클래스 풀은 모든 시나리오에서 시스템 할당자보다 빠르거나 같다. 특히 해제·재할당과 장시간 churn의 메모리에서 차이가 크다. 시스템 할당자는 해제된 메모리를 돌려주지 못하고 단편화된다.
