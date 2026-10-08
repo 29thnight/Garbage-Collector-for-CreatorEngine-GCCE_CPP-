@@ -45,7 +45,7 @@ gtest_discover_tests(gcce_tests DISCOVERY_MODE PRE_TEST)
 # (the same file without the offending line) must succeed.
 set(GCCE_COMPILE_FAIL_CASES
     new_expression array_new nothrow_new placement_new
-    delete_expression unique_ptr make_unmanaged)
+    delete_expression unique_ptr make_unmanaged make_twice_managed)
 foreach(case IN LISTS GCCE_COMPILE_FAIL_CASES)
     add_library(compile_fail_${case} OBJECT EXCLUDE_FROM_ALL compile_fail/${case}.cpp)
     target_link_libraries(compile_fail_${case} PRIVATE gcce::gcce)

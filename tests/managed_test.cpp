@@ -53,8 +53,8 @@ static_assert(!placement_newable<node> && !placement_newable<derived_polymorphic
 // Ordinary types are unaffected.
 static_assert(newable<plain> && deletable<plain>);
 
-// gc::managed adds no storage.
-static_assert(std::is_empty_v<gc::managed>);
+// gc::managed holds only the object's GC identity.
+static_assert(sizeof(gc::managed) == sizeof(void*));
 
 TEST(Managed, PolymorphicTypesStillWork)
 {

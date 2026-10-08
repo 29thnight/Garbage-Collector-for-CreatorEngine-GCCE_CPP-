@@ -25,3 +25,13 @@
 #        define GC_THREAD_CHECKS 1
 #    endif
 #endif
+
+// GCCE requires C++23 (deducing this is used by gc::managed).
+// Clang 18 implements explicit object parameters without defining the
+// feature-test macro, so it is accepted by version.
+#if defined(__cpp_explicit_this_parameter) && __cpp_explicit_this_parameter >= 202110L
+#elif defined(__clang__) && __clang_major__ >= 18 && __cplusplus > 202002L
+#elif defined(_MSC_VER) && !defined(__clang__) && _MSC_VER >= 1932 && defined(_MSVC_LANG) && _MSVC_LANG > 202002L
+#else
+#    error "GCCE requires C++23 with explicit object parameters (GCC 14, Clang 18, MSVC 19.32 or newer)"
+#endif

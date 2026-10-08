@@ -1,6 +1,7 @@
 #include "support.hpp"
 
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -40,10 +41,37 @@ struct both : gc::managed, left_base, right_base
 {
 };
 
-struct widget : gc::managed, gc::enable_ref_from_this<widget>
+struct widget : gc::managed
 {
     gc::root_ref<widget> seen_in_constructor;
     widget() { seen_in_constructor = root_from_this(); }
+
+    // A typical use: hand a reference to yourself to another object.
+    void attach_to(node& parent_like, std::vector<gc::trace_ref<widget>>& registry)
+    {
+        (void)parent_like;
+        registry.push_back(root_from_this());
+    }
+};
+
+struct panel_base : gc::managed
+{
+    virtual ~panel_base() = default;
+    gc::root_ref<panel_base> base_self() { return root_from_this(); }
+    gc::weak_ref<panel_base> base_weak_self() { return weak_from_this(); }
+};
+
+struct titled
+{
+    std::string title = "t";
+    virtual ~titled() = default;
+};
+
+// The managed base is not the first base: its address differs from the
+// most derived object's.
+struct titled_panel final : titled, panel_base
+{
+    gc::root_ref<titled_panel> self() { return root_from_this(); }
 };
 } // namespace
 
@@ -203,24 +231,89 @@ TEST(RefFromThis, ReturnsTheSameObject)
 {
     gc::domain d;
     auto w = gc::make<widget>(d);
-    EXPECT_FALSE(w->seen_in_constructor); // identity is set after construction
-
     gc::root_ref<widget> self = w->root_from_this();
+    static_assert(std::is_same_v<decltype(self), gc::root_ref<widget>>);
     EXPECT_TRUE(self == w);
     EXPECT_EQ(d.stats().roots, 2u);
 
     gc::weak_ref<widget> weak = w->weak_from_this();
+    EXPECT_TRUE(weak.lock() == w);
     w = nullptr;
     self = nullptr;
     d.collect_full();
     EXPECT_TRUE(weak.expired());
 }
 
-TEST(RefFromThis, CopiesHaveNoIdentity)
+TEST(RefFromThis, EmptyInsideTheConstructor)
+{
+    gc::domain d;
+    auto w = gc::make<widget>(d);
+    EXPECT_FALSE(w->seen_in_constructor); // identity is set after construction
+}
+
+TEST(RefFromThis, MemberFunctionCanRegisterItself)
+{
+    gc::domain d;
+    auto holder = gc::make<node>(d, 0);
+    std::vector<gc::trace_ref<widget>> registry;
+    {
+        auto w = gc::make<widget>(d);
+        w->attach_to(*holder, registry);
+    }
+    ASSERT_EQ(registry.size(), 1u);
+    EXPECT_TRUE(registry.front()); // the stray trace_ref itself is not a root
+    EXPECT_EQ(d.stats().roots, 1u);
+}
+
+// Deducing this: a base-class member function gets a reference typed and
+// adjusted for that base, the derived one gets the derived type.
+TEST(RefFromThis, FollowsTheTypeOfTheCall)
+{
+    gc::domain d;
+    auto obj = gc::make<titled_panel>(d);
+    panel_base* as_base = obj.get();
+    ASSERT_NE(static_cast<void*>(as_base), static_cast<void*>(obj.get()));
+
+    gc::root_ref<panel_base> b = obj->base_self();
+    EXPECT_EQ(b.get(), as_base);
+    EXPECT_TRUE(b == obj);
+
+    gc::root_ref<titled_panel> t = obj->self();
+    EXPECT_EQ(t.get(), obj.get());
+
+    gc::root_ref<panel_base> through_pointer = as_base->root_from_this();
+    EXPECT_TRUE(through_pointer == obj);
+
+    gc::weak_ref<panel_base> w = obj->base_weak_self();
+    obj = nullptr;
+    b = nullptr;
+    t = nullptr;
+    through_pointer = nullptr;
+    d.collect_full();
+    EXPECT_TRUE(w.expired());
+}
+
+TEST(RefFromThis, ConstObjectsGiveConstReferences)
+{
+    gc::domain d;
+    auto w = gc::make<widget>(d);
+    const widget& cw = *w;
+    auto r = cw.root_from_this();
+    static_assert(std::is_same_v<decltype(r), gc::root_ref<const widget>>);
+    EXPECT_TRUE(r == w);
+}
+
+TEST(RefFromThis, CopiesAndNonGcInstancesHaveNoIdentity)
 {
     gc::domain d;
     auto w = gc::make<widget>(d);
     widget copy = *w; // a plain value, not a GC object
     EXPECT_FALSE(copy.root_from_this());
     EXPECT_TRUE(copy.weak_from_this().expired());
+
+    widget local;
+    EXPECT_FALSE(local.root_from_this());
+
+    *w = local; // assignment never transfers identity
+    EXPECT_TRUE(w->root_from_this() == w);
 }

@@ -29,7 +29,7 @@ jobs:
       - name: Configure (Linux)
         if: runner.os == 'Linux'
         run: |
-          CXX=${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+          CXX=${{ matrix.compiler == 'clang' && 'clang++-18' || 'g++-14' }}
           FLAGS="${{ matrix.sanitize && '-fsanitize=address,undefined -fno-omit-frame-pointer' || '' }}"
           cmake -S . -B build -DCMAKE_CXX_COMPILER=$CXX -DCMAKE_BUILD_TYPE=${{ matrix.config }} \
                 -DGCCE_BUILD_SHARED=${{ matrix.shared }} -DCMAKE_CXX_FLAGS="$FLAGS"

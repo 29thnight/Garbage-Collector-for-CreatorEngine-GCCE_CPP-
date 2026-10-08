@@ -1,6 +1,6 @@
 # GCCE — CreatorEngine GC
 
-C++20 tracing GC 라이브러리. 명시적 루트와 정확한 추적을 사용하는 nonmoving mark-and-sweep이며, owner 스레드에서 프레임 예산만큼 나누어 수집한다. 설계 배경은 [docs/CreatorEngine_GC_Implementation_Plan.md](docs/CreatorEngine_GC_Implementation_Plan.md)에 있다.
+C++23 tracing GC 라이브러리. 명시적 루트와 정확한 추적을 사용하는 nonmoving mark-and-sweep이며, owner 스레드에서 프레임 예산만큼 나누어 수집한다. 설계 배경은 [docs/CreatorEngine_GC_Implementation_Plan.md](docs/CreatorEngine_GC_Implementation_Plan.md)에 있다.
 
 엔진 연동(Scene, Entity, 스크립트 핸들 등)은 이 저장소의 범위가 아니다. 이 저장소는 엔진이 사용할 GC 런타임과 그 계약만 제공한다.
 
@@ -19,7 +19,7 @@ struct Inventory : gc::managed
     void gc_trace(gc::tracer& t) const { t.visit(items); }
 };
 
-struct Item : gc::managed, gc::enable_ref_from_this<Item>
+struct Item : gc::managed
 {
     gc::trace_ref<Inventory> owner;
     void gc_trace(gc::tracer& t) const { t.visit(owner); }
@@ -49,7 +49,7 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 | 클래스 자신의 멤버 함수 안의 `delete this` | 컴파일되지만 실행 시 메시지 후 중단 |
 | 전역 한정 `::new (p) T` | 막지 않음 (의도적 우회) |
 
-`operator delete`를 삭제하거나 private으로 두면 가상 소멸자를 가진 GC 타입이 컴파일되지 않으므로 protected로 둔다. `gc::managed`는 빈 기반 클래스라 객체 크기를 늘리지 않는다. 스택, 전역, 다른 객체의 값 멤버로 GC 타입을 두는 것은 막지 않는다.
+`operator delete`를 삭제하거나 private으로 두면 가상 소멸자를 가진 GC 타입이 컴파일되지 않으므로 protected로 둔다. `gc::managed`는 객체의 GC 정체성(포인터 하나)만 가진다. 정확히 한 번 상속해야 하며, 두 번 상속하면 `gc::make`가 컴파일 오류를 낸다. 스택, 전역, 다른 객체의 값 멤버로 GC 타입을 두는 것은 막지 않는다.
 
 ## 할당자
 
@@ -71,7 +71,7 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 
 - 기반 클래스 변환(다중·가상 상속 포함), `static_ref_cast`, `dynamic_ref_cast`를 지원한다.
 - `==`와 `std::hash`는 객체 정체성 기준이다. 정적 타입이 달라도 같은 객체면 같다.
-- `gc::enable_ref_from_this<T>`로 객체 안에서 `root_from_this()`, `weak_from_this()`를 얻는다. 생성자 안에서는 빈 참조를 돌려준다.
+- 모든 GC 객체는 멤버 함수 안에서 `root_from_this()`, `weak_from_this()`로 자기 참조를 얻는다. deducing this로 호출한 타입 그대로의 참조가 나오므로, 다중 상속 객체의 기반 클래스 멤버 함수에서는 그 기반 타입으로 보정된 참조가, const 객체에서는 `root_ref<const T>`가 나온다. 생성자 안, 복사본, `gc::make`로 만들지 않은 인스턴스에서는 빈 참조다.
 - `root_ref::set_label("...")`로 루트 보유자 이름을 붙이면 진단에 표시된다.
 
 ## 추적
@@ -122,6 +122,8 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 root 등록, 참조 저장, 할당, 수집, weak 승격은 owner 스레드에서만 한다. 다른 스레드는 weak_ref를 복사·보관할 수 있고, owner 스레드가 root로 보존하는 동안 객체를 읽을 수 있다. 데이터 경쟁 방지는 사용자 책임이다. `bind_to_current_thread()`로 owner를 옮길 수 있다.
 
 ## 빌드와 테스트
+
+C++23이 필요하다. explicit object parameter(deducing this)를 지원하는 GCC 14, Clang 18, MSVC 19.32 이상에서 빌드한다.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug

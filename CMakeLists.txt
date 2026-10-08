@@ -5,7 +5,7 @@ option(GCCE_BUILD_SHARED "Build the GC runtime as a shared library (DLL)" OFF)
 option(GCCE_BUILD_TESTS "Build the test suite" ON)
 option(GCCE_THREAD_CHECKS "Report registry and graph changes off the owner thread" ON)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

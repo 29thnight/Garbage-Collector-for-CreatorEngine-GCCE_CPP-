@@ -1,7 +1,6 @@
 #pragma once
 
 #include "managed.hpp"
-#include "ref_from_this.hpp"
 #include "tracer.hpp"
 
 #include <new>
@@ -49,6 +48,7 @@ template <class T, class... Args>
     static_assert(std::is_object_v<T> && !std::is_array_v<T>, "gc::make: T must be a non-array object type");
     static_assert(std::is_base_of_v<managed, T>,
                   "gc::make: T must derive from gc::managed, which keeps new and delete away from GC objects");
+    static_assert(managed_type<T>, "gc::make: T must derive from gc::managed exactly once");
     static_assert(std::is_nothrow_destructible_v<T>, "gc::make: destructors of GC objects must not throw");
 
     auto pending = detail::domain_access::begin_allocation(d, detail::descriptor_for<T>());
@@ -62,8 +62,7 @@ template <class T, class... Args>
         detail::domain_access::abort_allocation(d, pending);
         throw;
     }
-    if constexpr (std::is_base_of_v<detail::ref_from_this_base, T>)
-        static_cast<detail::ref_from_this_base*>(object)->gc_self_header_ = pending.header;
+    detail::managed_access::set_header(*static_cast<managed*>(object), pending.header);
     detail::object_header* header = detail::domain_access::publish(d, pending);
     return detail::ref_access::make_root<T>(header, object);
 }
