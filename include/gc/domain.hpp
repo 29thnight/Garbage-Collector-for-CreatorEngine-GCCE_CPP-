@@ -3,6 +3,7 @@
 #include "config.hpp"
 #include "detail/header.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -15,6 +16,9 @@
 
 namespace gc
 {
+// marking also covers the incremental verification that precedes the
+// reclaim decision; the barrier is active throughout. The decision itself and
+// the switch to sweeping happen inside a single step and are not observable.
 enum class phase : std::uint8_t
 {
     idle,
@@ -57,6 +61,34 @@ struct collect_result
     std::size_t violations = 0;
 };
 
+using duration = std::chrono::nanoseconds;
+
+// Soft budget for one collect_step. Work is split at object boundaries, so a
+// single large object (a huge container, a slow destructor) or the finalize
+// transition can overrun it; overruns are recorded, not prevented.
+struct step_budget
+{
+    duration time = std::chrono::microseconds(250);
+    // Work units done even when the time is already spent, so that a busy
+    // frame cannot stall a cycle forever.
+    std::size_t min_units = 16;
+};
+
+struct step_result
+{
+    phase before = phase::idle;
+    phase after = phase::idle;
+    bool cycle_started = false;
+    bool cycle_finished = false; // completed or aborted in this step
+    bool finalized = false;      // the reclaim decision was taken in this step
+    bool over_budget = false;
+    bool refused = false;
+    std::size_t units = 0;
+    duration elapsed{};
+    duration longest_unit{};
+    duration finalize_time{};
+};
+
 struct statistics
 {
     phase current_phase = phase::idle;
@@ -68,7 +100,19 @@ struct statistics
     std::size_t bytes_since_last_cycle = 0;
     std::size_t allocation_threshold = 0;
     bool collection_requested = false;
-    collect_result last;
+    collect_result last;    // last finished cycle
+    collect_result current; // cycle in progress
+
+    // Incremental work (cumulative).
+    std::uint64_t steps = 0;
+    std::uint64_t steps_over_budget = 0;
+    std::uint64_t barrier_stores_during_mark = 0; // non-null stores while marking
+    std::uint64_t barrier_shades = 0;             // stores that added gray work
+    duration worst_step{};
+    duration worst_unit{};     // longest indivisible unit (one trace or destructor)
+    duration worst_finalize{}; // longest reclaim-decision transition
+    duration last_cycle_wall{}; // start to end of the last finished cycle
+    std::uint64_t last_cycle_steps = 0;
 };
 
 namespace detail
@@ -91,8 +135,14 @@ public:
     domain(const domain&) = delete;
     domain& operator=(const domain&) = delete;
 
-    // Runs a whole cycle. Only call from an engine-controlled safe point on
-    // the owner thread, never from constructors, tracers or destructors.
+    // Advances the collector within a soft budget. Starts a cycle when one
+    // was requested or the maximum interval elapsed; otherwise does nothing.
+    // Owner thread, engine safe points only; never from constructors,
+    // tracers or destructors.
+    step_result collect_step(const step_budget& budget = {});
+
+    // Finishes a cycle in progress, then runs a complete new cycle, for
+    // loading and shutdown boundaries. The result describes the new cycle.
     collect_result collect_full();
 
     // Records a request; the engine loop decides when to act on it.
@@ -101,6 +151,10 @@ public:
 
     // New GC bytes after which a collection is requested automatically.
     void set_allocation_threshold(std::size_t bytes) noexcept;
+
+    // collect_step starts a cycle when this much time has passed since the
+    // last one ended, even without new allocation. Zero disables it.
+    void set_max_cycle_interval(duration interval) noexcept;
 
     [[nodiscard]] statistics stats() const;
     [[nodiscard]] phase current_phase() const noexcept { return phase_; }
@@ -132,9 +186,19 @@ private:
     bool begin_cleanup_obligation(detail::object_header* header);
 
     void shade(detail::object_header* header);
+    [[nodiscard]] bool is_marked(const detail::object_header* header) const noexcept;
+    [[nodiscard]] bool is_condemned(const detail::object_header* header) const noexcept;
     void check_thread() noexcept;
     void report(violation_kind kind, const detail::object_header* header) noexcept;
     void reclaim(detail::object_header* header) noexcept;
+
+    bool enter_collection(bool& refused) noexcept;
+    void start_cycle();
+    // Does one unit of work. Returns false when the cycle ended.
+    bool do_unit(tracer& t, step_result& r);
+    void finalize(tracer& t, step_result& r);
+    void finish_cycle(bool completed);
+    void run_to_cycle_end();
 
     struct impl;
     std::unique_ptr<impl> impl_;

@@ -6,6 +6,7 @@ add_executable(gcce_tests
     test_construction.cpp
     test_lifecycle.cpp
     test_random.cpp
+    test_incremental.cpp
     test_threads_shutdown.cpp
 )
 target_link_libraries(gcce_tests PRIVATE gcce::gcce)

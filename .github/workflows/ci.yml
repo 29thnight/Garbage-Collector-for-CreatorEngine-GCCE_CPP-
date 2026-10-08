@@ -20,7 +20,7 @@ jobs:
           - { os: ubuntu-latest, compiler: gcc, config: Debug, shared: OFF, sanitize: true }
           - { os: ubuntu-latest, compiler: clang, config: Release, shared: ON }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'

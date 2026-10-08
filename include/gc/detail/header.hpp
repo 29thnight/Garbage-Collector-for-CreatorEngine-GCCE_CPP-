@@ -20,21 +20,6 @@ enum class lifecycle_state : std::uint8_t
 
 namespace detail
 {
-enum class mark_color : std::uint8_t
-{
-    white,
-    gray,
-    black
-};
-
-// live: may be promoted from weak_ref. condemned: chosen for reclamation in the
-// current sweep; weak promotion fails and new strong stores are violations.
-enum class reclaim_state : std::uint8_t
-{
-    live,
-    condemned
-};
-
 struct type_descriptor
 {
     const char* name;
@@ -55,8 +40,10 @@ struct object_header
     std::uint64_t alloc_serial = 0;
     std::uint32_t slot = 0;
     std::uint32_t generation = 0;
-    mark_color mark = mark_color::white;
-    reclaim_state reclaim = reclaim_state::live;
+    // Marked in the current cycle when equal to the domain's mark epoch.
+    // Gray and black are not distinguished: the insertion barrier shades the
+    // target regardless of the color of the object holding the reference.
+    std::uint32_t mark_epoch = 0;
     lifecycle_state lifecycle = lifecycle_state::alive;
     // Set once engine registration starts; cleared on reaching destroyed.
     bool cleanup_obligation = false;
