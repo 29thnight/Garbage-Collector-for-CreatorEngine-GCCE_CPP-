@@ -16,6 +16,8 @@ class managed;
 namespace detail
 {
 [[noreturn]] GC_API void managed_delete_called() noexcept;
+// Debug check: reports a gc::managed subobject constructed outside gc::make.
+GC_API void on_managed_constructed(const void* self) noexcept;
 struct managed_access;
 } // namespace detail
 
@@ -67,8 +69,8 @@ public:
     static void* operator new[](std::size_t, std::align_val_t) = delete;
 
 protected:
-    managed() noexcept = default;
-    managed(const managed&) noexcept {}
+    managed() noexcept { constructed(); }
+    managed(const managed&) noexcept { constructed(); }
     managed& operator=(const managed&) noexcept { return *this; }
     ~managed() = default;
 
@@ -81,6 +83,13 @@ private:
     friend struct detail::managed_access;
 
     static detail::object_header* header_of(const managed& m) noexcept { return m.gc_header_; }
+
+    void constructed() const noexcept
+    {
+#if GC_DEBUG_CHECKS
+        detail::on_managed_constructed(this);
+#endif
+    }
 
     detail::object_header* gc_header_ = nullptr;
 };

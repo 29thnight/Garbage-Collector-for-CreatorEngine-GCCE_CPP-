@@ -1,8 +1,21 @@
 #include "gc/domain.hpp"
+#include "gc/detail/testing.hpp"
 #include "gc/managed.hpp"
 #include "gc/tracer.hpp"
 
 #include "block_allocator.hpp"
+
+#if defined(_WIN32)
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#else
+#    include <dlfcn.h>
+#endif
 
 #if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
 #    include <intrin.h>
@@ -19,6 +32,9 @@
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <optional>
+#include <atomic>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -79,7 +95,123 @@ void default_violation_handler(const violation& v)
                  v.type_name ? v.type_name : "-");
     std::abort();
 }
+
+// The loaded module (DLL / shared object) containing an address.
+const void* module_of(const void* address) noexcept
+{
+#if defined(_WIN32)
+    HMODULE module = nullptr;
+    if (!::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              static_cast<LPCWSTR>(address), &module))
+        return nullptr;
+    return module;
+#else
+    Dl_info info{};
+    if (!::dladdr(address, &info))
+        return nullptr;
+    return info.dli_fbase;
+#endif
+}
+
+// ---- process-wide state
+
+std::mutex& global_mutex()
+{
+    static std::mutex m;
+    return m;
+}
+
+violation_handler& global_handler()
+{
+    static violation_handler h = &default_violation_handler;
+    return h;
+}
+
+void report_global(violation_kind kind) noexcept
+{
+    violation_handler handler;
+    {
+        std::lock_guard lock(global_mutex());
+        handler = global_handler();
+    }
+    handler(violation{kind, nullptr});
+}
+
+// Live domains, so a weak_ref can tell its domain is gone (debug checks).
+std::unordered_map<const domain*, std::uint64_t>& live_domains()
+{
+    static std::unordered_map<const domain*, std::uint64_t> m;
+    return m;
+}
+
+std::atomic<std::uint64_t> next_domain_id{1};
+
+struct registry_entry
+{
+    const domain* d;
+    explicit registry_entry(const domain* owner, std::uint64_t id) : d(owner)
+    {
+        std::lock_guard lock(global_mutex());
+        live_domains()[owner] = id;
+    }
+    ~registry_entry()
+    {
+        std::lock_guard lock(global_mutex());
+        live_domains().erase(d);
+    }
+    registry_entry(const registry_entry&) = delete;
+    registry_entry& operator=(const registry_entry&) = delete;
+};
+
+// Objects under construction by gc::make on this thread, innermost last.
+struct construction_frame
+{
+    domain* d;
+    const unsigned char* begin;
+    const unsigned char* end;
+    bool claimed;
+};
+thread_local std::vector<construction_frame> construction_frames;
 } // namespace
+
+void set_global_violation_handler(violation_handler handler)
+{
+    std::lock_guard lock(global_mutex());
+    global_handler() = handler ? std::move(handler) : violation_handler(&default_violation_handler);
+}
+
+namespace detail
+{
+void push_construction(domain& d, void* object, std::size_t size)
+{
+    const auto* begin = static_cast<const unsigned char*>(object);
+    construction_frames.push_back({&d, begin, begin + size, false});
+}
+
+void pop_construction() noexcept { construction_frames.pop_back(); }
+
+void on_managed_constructed(const void* self) noexcept
+{
+    const auto* p = static_cast<const unsigned char*>(self);
+    if (!construction_frames.empty())
+    {
+        construction_frame& f = construction_frames.back();
+        if (p >= f.begin && p < f.end)
+        {
+            if (!f.claimed)
+            {
+                f.claimed = true; // the object gc::make is constructing
+                return;
+            }
+            // A second managed subobject in the same block: a GC type held
+            // by value inside the object being made.
+            domain_access::report(*f.d, violation_kind::created_outside_make, nullptr);
+            return;
+        }
+    }
+    report_global(violation_kind::created_outside_make);
+}
+} // namespace detail
 
 namespace detail
 {
@@ -102,6 +234,9 @@ const char* to_string(violation_kind kind) noexcept
     case violation_kind::unreachable_with_cleanup_obligation: return "unreachable_with_cleanup_obligation";
     case violation_kind::roots_remaining_at_shutdown: return "roots_remaining_at_shutdown";
     case violation_kind::objects_remaining_at_shutdown: return "objects_remaining_at_shutdown";
+    case violation_kind::created_outside_make: return "created_outside_make";
+    case violation_kind::root_inside_gc_object: return "root_inside_gc_object";
+    case violation_kind::weak_ref_outlived_domain: return "weak_ref_outlived_domain";
     }
     return "unknown";
 }
@@ -173,6 +308,9 @@ struct domain::impl
     collect_result last;
 
     violation_handler handler = &default_violation_handler;
+    // Unregistered when the impl is destroyed, after the domain's destructor
+    // body (which may still run destructors that use weak references).
+    std::optional<registry_entry> registration;
 
     explicit impl(const domain_config& config)
         : allocator(config.heap == heap_kind::system ? detail::pool_mode::system : detail::pool_mode::size_classes)
@@ -216,7 +354,11 @@ struct domain::impl
 
 domain::domain() : domain(domain_config{}) {}
 
-domain::domain(const domain_config& config) : impl_(std::make_unique<impl>(config)) {}
+domain::domain(const domain_config& config)
+    : impl_(std::make_unique<impl>(config)), id_(next_domain_id.fetch_add(1, std::memory_order_relaxed))
+{
+    impl_->registration.emplace(this, id_);
+}
 
 domain::~domain()
 {
@@ -437,6 +579,18 @@ void domain::link_root(detail::root_node* node)
 {
     impl& s = *impl_;
     check_thread();
+#if GC_DEBUG_CHECKS
+    // A root inside a GC object would keep its graph alive after the object
+    // itself became unreachable.
+    if (void* block = s.allocator.find_block(node))
+    {
+        const auto* h = static_cast<const detail::object_header*>(block);
+        const auto* p = reinterpret_cast<const unsigned char*>(node);
+        const auto* object = static_cast<const unsigned char*>(h->object);
+        if (h->owner == this && h->slot < s.slots.size() && p >= object && p < object + h->type->size)
+            report(violation_kind::root_inside_gc_object, h);
+    }
+#endif
     node->prev = &s.roots;
     node->next = s.roots.next;
     s.roots.next->prev = node;
@@ -463,16 +617,31 @@ void domain::unlink_root(detail::root_node* node) noexcept
     --impl_->root_count;
 }
 
-detail::object_header* domain::resolve_weak(std::uint32_t index, std::uint32_t generation)
+detail::object_header* domain::resolve_weak(domain* d, std::uint64_t id, std::uint32_t index,
+                                            std::uint32_t generation)
 {
-    impl& s = *impl_;
-    check_thread();
+#if GC_DEBUG_CHECKS
+    {
+        std::unique_lock lock(global_mutex());
+        auto it = live_domains().find(d);
+        if (it == live_domains().end() || it->second != id)
+        {
+            lock.unlock();
+            report_global(violation_kind::weak_ref_outlived_domain);
+            return nullptr;
+        }
+    }
+#else
+    (void)id;
+#endif
+    impl& s = *d->impl_;
+    d->check_thread();
     if (index >= s.slots.size())
         return nullptr;
     const slot& sl = s.slots[index];
     if (!sl.header || sl.generation != generation)
         return nullptr;
-    if (is_condemned(sl.header))
+    if (d->is_condemned(sl.header))
         return nullptr;
     return sl.header;
 }
@@ -976,4 +1145,49 @@ std::vector<object_info> domain::retention_path(const detail::object_header* tar
     std::reverse(path.begin(), path.end());
     return path;
 }
+// ------------------------------------------------------------ modules
+
+std::size_t domain::objects_in_module(const void* address_in_module) const
+{
+    const impl& s = *impl_;
+    const void* module = module_of(address_in_module);
+    if (!module)
+        return 0;
+    // Looked up per call: a cache could outlive an unloaded module whose
+    // addresses are later reused.
+    std::unordered_map<const detail::type_descriptor*, const void*> type_modules;
+    std::size_t count = 0;
+    for (const slot& sl : s.slots)
+    {
+        if (!sl.header)
+            continue;
+        const detail::type_descriptor* type = sl.header->type;
+        auto [it, inserted] = type_modules.try_emplace(type, nullptr);
+        if (inserted)
+            it->second = module_of(type);
+        count += it->second == module;
+    }
+    return count;
+}
+// ------------------------------------------------------------ testing hooks
+
+namespace detail
+{
+std::uint32_t domain_testing::mark_epoch(const domain& d) noexcept { return d.impl_->epoch; }
+
+void domain_testing::set_mark_epoch(domain& d, std::uint32_t epoch) noexcept { d.impl_->epoch = epoch; }
+
+std::uint32_t domain_testing::slot_generation(const domain& d, std::uint32_t slot) noexcept
+{
+    return d.impl_->slots[slot].generation;
+}
+
+void domain_testing::set_slot_generation(domain& d, std::uint32_t slot, std::uint32_t generation) noexcept
+{
+    auto& sl = d.impl_->slots[slot];
+    sl.generation = generation;
+    if (sl.header)
+        sl.header->generation = generation;
+}
+} // namespace detail
 } // namespace gc

@@ -292,7 +292,8 @@ private:
 // the memory is protected; whether the engine may still use the object is a
 // separate lifecycle check. Promotion touches the root registry, so it is
 // owner-thread only; other threads may store and copy weak_refs.
-// The domain must outlive every weak_ref that is still locked or expired-checked.
+// The domain must outlive every weak_ref that is still locked or expired-checked;
+// with debug checks, use after the domain is gone is reported.
 template <class T>
 class weak_ref
 {
@@ -319,7 +320,7 @@ public:
     template <class U>
         requires detail::ref_convertible<U, T>
     weak_ref(const weak_ref<U>& w) noexcept
-        : domain_(w.domain_), slot_(w.slot_), generation_(w.generation_), ptr_(w.ptr_)
+        : domain_(w.domain_), domain_id_(w.domain_id_), slot_(w.slot_), generation_(w.generation_), ptr_(w.ptr_)
     {
     }
 
@@ -327,7 +328,7 @@ public:
     {
         if (!domain_)
             return {};
-        detail::object_header* h = detail::domain_access::resolve_weak(*domain_, slot_, generation_);
+        detail::object_header* h = detail::domain_access::resolve_weak(domain_, domain_id_, slot_, generation_);
         if (!h)
             return {};
         return detail::ref_access::make_root<T>(h, ptr_);
@@ -336,7 +337,7 @@ public:
     // True when promotion would fail. Owner thread only.
     [[nodiscard]] bool expired() const
     {
-        return !domain_ || detail::domain_access::resolve_weak(*domain_, slot_, generation_) == nullptr;
+        return !domain_ || detail::domain_access::resolve_weak(domain_, domain_id_, slot_, generation_) == nullptr;
     }
 
     void reset() noexcept { *this = weak_ref(); }
@@ -350,12 +351,14 @@ private:
         if (!h)
             return;
         domain_ = h->owner;
+        domain_id_ = detail::domain_access::id(*h->owner);
         slot_ = h->slot;
         generation_ = h->generation;
         ptr_ = p;
     }
 
     domain* domain_ = nullptr;
+    std::uint64_t domain_id_ = 0; // detects use after the domain is gone (debug checks)
     std::uint32_t slot_ = 0;
     std::uint32_t generation_ = 0;
     T* ptr_ = nullptr; // never dereferenced unless promotion succeeds

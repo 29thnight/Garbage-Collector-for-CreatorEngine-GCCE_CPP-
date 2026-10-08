@@ -302,18 +302,3 @@ TEST(RefFromThis, ConstObjectsGiveConstReferences)
     static_assert(std::is_same_v<decltype(r), gc::root_ref<const widget>>);
     EXPECT_TRUE(r == w);
 }
-
-TEST(RefFromThis, CopiesAndNonGcInstancesHaveNoIdentity)
-{
-    gc::domain d;
-    auto w = gc::make<widget>(d);
-    widget copy = *w; // a plain value, not a GC object
-    EXPECT_FALSE(copy.root_from_this());
-    EXPECT_TRUE(copy.weak_from_this().expired());
-
-    widget local;
-    EXPECT_FALSE(local.root_from_this());
-
-    *w = local; // assignment never transfers identity
-    EXPECT_TRUE(w->root_from_this() == w);
-}

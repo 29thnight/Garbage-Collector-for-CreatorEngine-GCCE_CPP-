@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 namespace gc::detail
@@ -63,6 +64,11 @@ public:
     // and chunks to the OS.
     void end_cycle() noexcept;
 
+    // Start of the allocated block containing p, or nullptr. Pooled blocks
+    // are always found; individually allocated blocks only when debug checks
+    // are on (they are tracked only then).
+    [[nodiscard]] void* find_block(const void* p) const noexcept;
+
     // Abandons all chunks without unmapping them, for shutdown with objects
     // that are still referenced from outside.
     void leak() noexcept;
@@ -93,6 +99,8 @@ private:
 
     std::vector<pool_state> pools_;
     std::vector<chunk*> chunks_;          // every mapped chunk
+    std::map<std::uintptr_t, chunk*> chunk_index_; // by base address, for find_block
+    std::map<std::uintptr_t, std::size_t> individual_blocks_; // debug checks only
     chunk* chunks_with_free_ = nullptr;   // chunks that have at least one free page
     std::size_t pages_in_use_ = 0;
     std::size_t committed_pages_ = 0;     // in use or idle but still committed

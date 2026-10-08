@@ -1,5 +1,7 @@
 #include "block_allocator.hpp"
 
+#include "gc/config.hpp"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -243,6 +245,7 @@ block_allocator::chunk* block_allocator::map_chunk()
         throw;
     }
     c->index = chunks_.size() - 1;
+    chunk_index_.emplace(reinterpret_cast<std::uintptr_t>(c->base), c);
     GCCE_UNPOISON(c->base, chunk_size); // no stale shadow from an earlier mapping
     GCCE_POISON(c->base, chunk_size);
     push_chunk(c);
@@ -260,6 +263,7 @@ void block_allocator::unmap_chunk(chunk* c) noexcept
     chunks_[c->index] = chunks_.back();
     chunks_[c->index]->index = c->index;
     chunks_.pop_back();
+    chunk_index_.erase(reinterpret_cast<std::uintptr_t>(c->base));
 
     GCCE_UNPOISON(c->base, chunk_size);
     os_unmap(c->base, chunk_size);
@@ -361,17 +365,24 @@ void block_allocator::end_cycle() noexcept
 
 block_allocator::allocation block_allocator::allocate(std::size_t size, std::size_t align)
 {
-    if (mode_ == pool_mode::system && align <= __STDCPP_DEFAULT_NEW_ALIGNMENT__)
-    {
-        void* block = ::operator new(size);
-        individual_bytes_ += size;
-        return {block, system_class};
-    }
     if (mode_ == pool_mode::system || align > small_align || size > max_pooled_size)
     {
-        void* block = ::operator new(size, std::align_val_t{std::max(align, small_align)});
+        const bool plain = mode_ == pool_mode::system && align <= __STDCPP_DEFAULT_NEW_ALIGNMENT__;
+        void* block = plain ? ::operator new(size) : ::operator new(size, std::align_val_t{std::max(align, small_align)});
         individual_bytes_ += size;
-        return {block, large_class};
+#if GC_DEBUG_CHECKS
+        try
+        {
+            individual_blocks_.emplace(reinterpret_cast<std::uintptr_t>(block), size);
+        }
+        catch (...)
+        {
+            plain ? ::operator delete(block) : ::operator delete(block, std::align_val_t{std::max(align, small_align)});
+            individual_bytes_ -= size;
+            throw;
+        }
+#endif
+        return {block, plain ? system_class : large_class};
     }
 
     const std::uint16_t pool = class_lookup[(size + small_align - 1) / small_align];
@@ -399,16 +410,16 @@ block_allocator::allocation block_allocator::allocate(std::size_t size, std::siz
 
 void block_allocator::deallocate(void* block, std::size_t size, std::size_t align, std::uint16_t pool) noexcept
 {
-    if (pool == system_class)
+    if (pool == system_class || pool == large_class)
     {
         individual_bytes_ -= size;
-        ::operator delete(block);
-        return;
-    }
-    if (pool == large_class)
-    {
-        individual_bytes_ -= size;
-        ::operator delete(block, std::align_val_t{std::max(align, small_align)});
+#if GC_DEBUG_CHECKS
+        individual_blocks_.erase(reinterpret_cast<std::uintptr_t>(block));
+#endif
+        if (pool == system_class)
+            ::operator delete(block);
+        else
+            ::operator delete(block, std::align_val_t{std::max(align, small_align)});
         return;
     }
 
@@ -431,4 +442,33 @@ void block_allocator::deallocate(void* block, std::size_t size, std::size_t alig
     if (!p->listed)
         push(state.available, p); // was full
 }
+void* block_allocator::find_block(const void* p) const noexcept
+{
+    const auto a = reinterpret_cast<std::uintptr_t>(p);
+    if (auto it = chunk_index_.upper_bound(a); it != chunk_index_.begin())
+    {
+        --it;
+        const chunk* c = it->second;
+        if (a < it->first + chunk_size)
+        {
+            const auto index = static_cast<unsigned>((a - it->first) / page_size);
+            if (c->free_mask & (1u << index))
+                return nullptr; // page not in use
+            const auto* pg = reinterpret_cast<const page*>(it->first + std::size_t{index} * page_size);
+            const auto first = reinterpret_cast<std::uintptr_t>(pg) + page_header_size;
+            if (a < first || a >= reinterpret_cast<std::uintptr_t>(pg->bump))
+                return nullptr; // header or never-used tail
+            const std::size_t block = pools_[pg->pool].block_size;
+            return reinterpret_cast<void*>(first + (a - first) / block * block);
+        }
+    }
+    if (auto it = individual_blocks_.upper_bound(a); it != individual_blocks_.begin())
+    {
+        --it;
+        if (a < it->first + it->second)
+            return reinterpret_cast<void*>(it->first);
+    }
+    return nullptr;
+}
+
 } // namespace gc::detail

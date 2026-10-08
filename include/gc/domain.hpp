@@ -35,7 +35,11 @@ enum class violation_kind : std::uint8_t
     store_of_condemned_object,          // strong reference created to an object being reclaimed
     unreachable_with_cleanup_obligation,// engine cleanup unfinished but no longer reachable
     roots_remaining_at_shutdown,
-    objects_remaining_at_shutdown
+    objects_remaining_at_shutdown,
+    // Debug checks (GC_DEBUG_CHECKS):
+    created_outside_make,     // a gc::managed object on the stack, global, member or copy
+    root_inside_gc_object,    // a root_ref stored inside a GC object
+    weak_ref_outlived_domain  // weak_ref used after its domain was destroyed
 };
 
 [[nodiscard]] GC_API const char* to_string(violation_kind kind) noexcept;
@@ -49,6 +53,11 @@ struct violation
 // The default handler prints the violation and aborts. A replacement handler
 // that returns lets the operation continue; that is meant for tests and tools.
 using violation_handler = std::function<void(const violation&)>;
+
+// Handler for violations that belong to no domain (created_outside_make
+// outside any gc::make, weak_ref_outlived_domain). Process-wide; the default
+// prints and aborts. Passing an empty handler restores the default.
+GC_API void set_global_violation_handler(violation_handler handler);
 
 struct collect_result
 {
@@ -180,7 +189,8 @@ struct statistics
 namespace detail
 {
 struct domain_access;
-}
+struct domain_testing;
+} // namespace detail
 
 // A GC domain: object registry, root list, weak slot table and an
 // incremental, nonmoving mark-and-sweep collector driven from one owner
@@ -220,6 +230,15 @@ public:
     void set_pacing(const pacing& p) noexcept;
     void set_obligation_policy(obligation_policy policy) noexcept;
 
+    // Module (DLL / shared object) unload safety. Every GC object runs code
+    // from the module that instantiated its type (gc_trace, the destructor),
+    // so a module must not be unloaded while objects of its types exist.
+    // Returns how many live objects have types from the module containing
+    // `address_in_module` (any function or static data of that module).
+    // Unload only when this is 0, typically after dropping the module's
+    // objects and running collect_full. Owner thread, outside collection.
+    [[nodiscard]] std::size_t objects_in_module(const void* address_in_module) const;
+
     // Diagnostics. Owner thread; not from inside trace functions.
     void for_each_root(const std::function<void(const object_info&)>& fn) const;
     void for_each_quarantined(const std::function<void(const object_info&)>& fn) const;
@@ -234,6 +253,7 @@ public:
 
 private:
     friend struct detail::domain_access;
+    friend struct detail::domain_testing;
     friend class tracer;
 
     struct pending_allocation
@@ -249,7 +269,9 @@ private:
     void link_root(detail::root_node* node);
     void link_new_root(detail::root_node* node) noexcept;
     void unlink_root(detail::root_node* node) noexcept;
-    [[nodiscard]] detail::object_header* resolve_weak(std::uint32_t slot, std::uint32_t generation);
+    [[nodiscard]] static detail::object_header* resolve_weak(domain* d, std::uint64_t id, std::uint32_t slot,
+                                                             std::uint32_t generation);
+    [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
 
     bool advance_lifecycle(detail::object_header* header, lifecycle_state next);
     bool begin_cleanup_obligation(detail::object_header* header);
@@ -275,6 +297,7 @@ private:
 
     struct impl;
     std::unique_ptr<impl> impl_;
+    std::uint64_t id_ = 0; // unique per domain instance in the process
     phase phase_ = phase::idle;
 };
 
@@ -294,9 +317,9 @@ struct domain_access
     static void link_root(root_node* node) { node->header->owner->link_root(node); }
     static void link_new_root(root_node* node) noexcept { node->header->owner->link_new_root(node); }
     static void unlink_root(root_node* node) noexcept { node->header->owner->unlink_root(node); }
-    static object_header* resolve_weak(domain& d, std::uint32_t slot, std::uint32_t generation)
+    static object_header* resolve_weak(domain* d, std::uint64_t id, std::uint32_t slot, std::uint32_t generation)
     {
-        return d.resolve_weak(slot, generation);
+        return domain::resolve_weak(d, id, slot, generation);
     }
 
     static bool advance_lifecycle(object_header* h, lifecycle_state next)
@@ -305,6 +328,22 @@ struct domain_access
     }
     static bool begin_cleanup_obligation(object_header* h) { return h->owner->begin_cleanup_obligation(h); }
     static std::vector<object_info> retention_path(const object_header* h) { return h->owner->retention_path(h); }
+    static std::uint64_t id(const domain& d) noexcept { return d.id_; }
+    static void report(domain& d, violation_kind kind, const object_header* h) noexcept { d.report(kind, h); }
+};
+
+// Debug checks for GC types created outside gc::make. gc::make opens a
+// construction scope around the constructor; the gc::managed constructor
+// claims it. Thread-local, nestable.
+GC_API void push_construction(domain& d, void* object, std::size_t size);
+GC_API void pop_construction() noexcept;
+
+struct construction_scope
+{
+    construction_scope(domain& d, void* object, std::size_t size) { push_construction(d, object, size); }
+    ~construction_scope() { pop_construction(); }
+    construction_scope(const construction_scope&) = delete;
+    construction_scope& operator=(const construction_scope&) = delete;
 };
 } // namespace detail
 } // namespace gc

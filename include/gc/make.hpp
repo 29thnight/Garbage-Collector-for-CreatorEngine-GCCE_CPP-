@@ -55,6 +55,9 @@ template <class T, class... Args>
     T* object = nullptr;
     try
     {
+#if GC_DEBUG_CHECKS
+        detail::construction_scope scope(d, pending.header->object, sizeof(T));
+#endif
         object = ::new (pending.header->object) T(std::forward<Args>(args)...);
     }
     catch (...)

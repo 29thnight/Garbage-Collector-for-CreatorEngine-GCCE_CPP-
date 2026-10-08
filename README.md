@@ -70,13 +70,24 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 
 | 시나리오 | Linux 크기 클래스 | Linux 시스템 | Windows 크기 클래스 | Windows 시스템 |
 | --- | --- | --- | --- | --- |
-| 할당자 단독: 할당 / 무작위 해제 / 재할당 / 전체 해제 (ns/op) | 10 / 86 / 70 / 22 | 87 / 245 / 308 / 191 | 8 / 49 / 63 / 16 | 96 / 140 / 138 / 107 |
-| GC 할당 / 회수 (ns/객체) | 102 / 111 | 116 / 136 | 84 / 112 | 218 / 193 |
-| Mark (ns/객체) | 409 | 460 | 204 | 220 |
-| 프레임 churn p50 / p99 (ms) | 3.85 / 5.41 | 4.78 / 6.18 | 1.80 / 2.48 | 2.01 / 2.61 |
-| 프레임 churn 종료 시 RSS | 127 MiB | 272 MiB | 49 MiB | 53 MiB |
+| 할당자 단독: 할당 / 무작위 해제 / 재할당 / 전체 해제 (ns/op) | 9 / 93 / 67 / 22 | 68 / 264 / 308 / 176 | 8 / 49 / 63 / 16 | 96 / 140 / 138 / 107 |
+| GC 할당 / 회수 (ns/객체) | 84 / 49 | 98 / 66 | 84 / 112 | 218 / 193 |
+| Mark (ns/객체) | 96 | 107 | 204 | 220 |
+| 프레임 churn p50 / p99 (ms) | 1.93 / 4.31 | 2.74 / 5.02 | 1.80 / 2.48 | 2.01 / 2.61 |
+| 프레임 churn 종료 시 RSS | 100 MiB | 272 MiB | 49 MiB | 53 MiB |
 
-Linux는 x86-64, GCC 14 Release, glibc malloc 기준이다. Windows는 GitHub Actions `windows-latest`, MSVC Release, 기본 힙 기준이며 절반 규모로 실행했다.
+Linux는 x86-64, GCC 14 Release, glibc malloc 기준이며 수집기 최적화(아래) 이후에 측정했다. Windows는 GitHub Actions `windows-latest`, MSVC Release, 기본 힙 기준이며, 절반 규모로 수집기 최적화 이전에 측정했다. 두 힙의 상대 비교는 같은 조건끼리만 의미가 있다.
+
+### 수집기 최적화
+
+Linux 벤치마크(절반 규모)에서 다음 변경의 효과를 측정했다.
+
+| 변경 | 효과 |
+| --- | --- |
+| 작업 단위마다 시계를 읽지 않고, 단계 경계에서 시간을 재고 8단위 또는 무거운 단위 뒤에만 예산을 확인 | 회수 115 → 47 ns/객체, Mark 385 → 225 ns/객체 |
+| Gray 스택과 추적 사이에 8칸 prefetch 링을 두고, 간선을 모아 prefetch한 뒤 표시 | Mark 225 → 약 80 ns/객체 (무작위 25만 객체 그래프) |
+| `gc::make`의 root 등록에서 중복 검사 제거, Release에서 디버그 검사 끔 | 할당 100 → 84 ns/객체 |
+| 결과 | 프레임 churn p50 2.2 → 1.0~1.5 ms, 같은 프레임 수에서 완료한 사이클 24 → 56 |
 
 - **크기 클래스 풀:** 모든 시나리오에서 시스템 할당자보다 빠르거나 같다. 특히 해제 후 재할당과, glibc에서 장시간 churn의 메모리 사용량에서 차이가 크다.
 - **타입별 풀(채택하지 않음):** 타입마다 고정 크기 풀을 두는 방식도 측정했다. 객체가 많은 타입에서는 크기 클래스 풀과 비슷했지만, 객체가 적은 타입이 많으면(200개 타입, 객체 6000개) 타입마다 페이지를 하나씩 commit해 크기 클래스 풀의 약 4배(12.7 MiB 대 3.2 MiB)를 썼다.
@@ -138,6 +149,34 @@ Linux는 x86-64, GCC 14 Release, glibc malloc 기준이다. Windows는 GitHub Ac
 
 `violation_kind`: 잘못된 스레드의 변경, 중첩 수집, 추적 중 할당, 회수 확정 객체의 재게시, 정리 의무 위반, 종료 시 남은 root와 객체. 기본 처리기는 메시지를 출력하고 `abort`한다. `set_violation_handler`로 바꿀 수 있다.
 
+## 디버그 검사
+
+`GC_DEBUG_CHECKS`가 켜지면(기본: Debug 빌드) 타입 시스템으로 막을 수 없는 잘못된 사용을 위반으로 보고한다. Release에서는 코드가 빠져 비용이 없다.
+
+| 위반 | 탐지 방법 |
+| --- | --- |
+| `wrong_thread` | owner 스레드가 아닌 곳에서 root 등록, 참조 저장, 할당, 수집, weak 승격 |
+| `created_outside_make` | `gc::managed` 생성자가 `gc::make`의 생성 범위 밖에서 실행됨. 스택·전역 인스턴스와 복사본, GC 객체 안에 값으로 둔 GC 타입 |
+| `root_inside_gc_object` | `root_ref`가 등록될 때 그 주소가 살아 있는 GC 객체 안에 있음 |
+| `weak_ref_outlived_domain` | 파괴된 도메인의 `weak_ref`를 `lock()`·`expired()`함. 프로세스 전역 도메인 등록부로 확인해 해제된 메모리를 읽지 않고 빈 참조를 돌려준다 |
+
+도메인에 속하지 않는 위반(도메인 밖의 `created_outside_make`, `weak_ref_outlived_domain`)은 `gc::set_global_violation_handler`로 받는다.
+
+## 작업 스레드에 객체 넘기기
+
+`gc::pinned<T>`는 작업 스레드가 raw pointer로 객체를 쓰는 동안 그 객체를 보존하는 이동 전용 root다. owner 스레드에서 만들고, 작업이 끝난 뒤 owner 스레드에서 해제한다. `for_each_root`와 retention path에 `gc.pinned` 라벨로 나타난다.
+
+```cpp
+gc::pinned<Mesh> pin(mesh);
+jobs.run([p = pin.get()] { build_bvh(*p); });
+jobs.wait();
+pin.release();
+```
+
+## 모듈(DLL) 언로드
+
+GC 객체는 자기 타입을 인스턴스화한 모듈의 코드(`gc_trace`, 소멸자)를 실행하므로, 그 모듈의 객체가 남아 있는 동안 모듈을 내리면 안 된다. `domain::objects_in_module(address)`는 주어진 주소가 속한 모듈에서 온 타입의 살아 있는 객체 수를 센다. 모듈의 객체를 놓고 `collect_full()`을 실행해 0이 된 뒤 언로드한다. 모듈은 타입 정보의 주소로 판별한다(Linux `dladdr`, Windows `GetModuleHandleEx`).
+
 ## 스레드 규약
 
 root 등록, 참조 저장, 할당, 수집, weak 승격은 owner 스레드에서만 한다. 다른 스레드는 weak_ref를 복사·보관할 수 있고, owner 스레드가 root로 보존하는 동안 객체를 읽을 수 있다. 데이터 경쟁 방지는 사용자 책임이다. `bind_to_current_thread()`로 owner를 옮길 수 있다.
@@ -178,8 +217,12 @@ ctest --test-dir build --output-on-failure
 | `managed_test` | 모든 할당 형태의 컴파일 차단(정적 검사), 다형 타입 동작, `delete this` death test |
 | `allocator_test` | 페이지 할당, 블록 재사용, 빈 페이지의 다른 크기 재사용, 2사이클 뒤 OS 반환, 큰 객체, 정렬, 주소 중복 없음, 두 힙에서 같은 작업의 내용 무결성 |
 | `compile_fail/` | `new`, `new[]`, nothrow, placement, `delete`, `unique_ptr`, 비관리 타입 `make`가 빌드 실패하는지 확인. 각 경우마다 문제 줄만 뺀 대조 빌드가 성공해야 한다 |
+| `misuse_test` | GC 타입의 스택·복사·값 멤버 생성, GC 객체 안의 root, 도메인보다 오래 산 weak_ref, 전역 처리기 death test |
+| `pinned_test` | 작업 스레드가 읽는 동안의 보존, 이동 전용, 라벨 |
+| `module_test` | 모듈별 객체 수. 공유 라이브러리 빌드에서는 플러그인 모듈을 실제로 로드해 객체 생성, 회수, 언로드까지 확인 |
+| `edge_test` | mark epoch wrap과 슬롯 세대 최댓값의 퇴역을 테스트 훅으로 강제해 검증 |
 | `stress_test` | seed 40개의 무작위 그래프. 전체 수집은 oracle과 정확히 일치, 증분 수집은 도달 가능 객체를 회수하지 않고 안정화 후 garbage를 남기지 않음 |
 
-barrier 제거, 판정 직전 표시 작업 재소진 제거, 할당 cutoff 제거, Mark 중 정리 의무 표시 제거, 격리 루트 스캔 제거의 다섯 가지 구현 변형을 각각 테스트가 탐지하는지 확인했다.
+barrier 제거, 판정 직전 표시 작업 재소진 제거, 할당 cutoff 제거, Mark 중 정리 의무 표시 제거, 격리 루트 스캔 제거, epoch wrap 처리 제거, 퇴역 슬롯 재사용의 일곱 가지 구현 변형을 각각 테스트가 탐지하는지 확인했다.
 
 CI는 MSVC Debug/Release × 정적/DLL, GCC Debug(ASan/UBSan), Clang Release(공유 라이브러리)에서 실행한다.

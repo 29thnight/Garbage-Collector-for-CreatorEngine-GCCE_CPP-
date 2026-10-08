@@ -24,6 +24,7 @@ endif()
 add_library(gcce::gcce ALIAS gcce)
 
 target_include_directories(gcce PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gcce PRIVATE ${CMAKE_DL_LIBS})
 if(GCCE_DEBUG_CHECKS STREQUAL "ON")
     target_compile_definitions(gcce PUBLIC GC_DEBUG_CHECKS=1)
 elseif(GCCE_DEBUG_CHECKS STREQUAL "OFF")
@@ -45,7 +46,7 @@ if(GCCE_BUILD_BENCHMARKS)
 
     # Builds the allocator source directly: it is internal to the library.
     add_executable(gcce_allocator_bench bench/allocator_bench.cpp src/block_allocator.cpp)
-    target_include_directories(gcce_allocator_bench PRIVATE src)
+    target_include_directories(gcce_allocator_bench PRIVATE src include)
 endif()
 
 if(GCCE_BUILD_TESTS)

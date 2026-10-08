@@ -29,6 +29,10 @@ add_executable(gcce_tests
     stress_test.cpp
     managed_test.cpp
     allocator_test.cpp
+    misuse_test.cpp
+    module_test.cpp
+    pinned_test.cpp
+    edge_test.cpp
 )
 target_link_libraries(gcce_tests PRIVATE gcce::gcce GTest::gtest_main)
 
@@ -36,6 +40,18 @@ if(MSVC)
     target_compile_options(gcce_tests PRIVATE /W4 /permissive- /bigobj)
 else()
     target_compile_options(gcce_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+target_link_libraries(gcce_tests PRIVATE ${CMAKE_DL_LIBS})
+
+# A separately loaded module for the unload test; it needs the shared runtime.
+if(GCCE_BUILD_SHARED)
+    add_library(gcce_test_plugin MODULE plugin/plugin.cpp)
+    target_link_libraries(gcce_test_plugin PRIVATE gcce::gcce)
+    set_target_properties(gcce_test_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+                                                      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_dependencies(gcce_tests gcce_test_plugin)
+    target_compile_definitions(gcce_tests PRIVATE GCCE_TEST_PLUGIN="$<TARGET_FILE:gcce_test_plugin>")
 endif()
 
 include(GoogleTest)
