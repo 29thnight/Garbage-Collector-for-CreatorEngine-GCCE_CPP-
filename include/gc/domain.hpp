@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #if defined(_MSC_VER)
 #    pragma warning(push)
@@ -59,6 +60,9 @@ struct collect_result
     std::size_t reclaimed = 0;
     std::size_t reclaimed_bytes = 0;
     std::size_t violations = 0;
+    std::size_t quarantined = 0; // objects moved to quarantine by this cycle
+    std::chrono::nanoseconds mark_time{};  // tracing, verification and the reclaim decision
+    std::chrono::nanoseconds sweep_time{}; // destructors and slot release
 };
 
 using duration = std::chrono::nanoseconds;
@@ -87,6 +91,40 @@ struct step_result
     duration elapsed{};
     duration longest_unit{};
     duration finalize_time{};
+    double budget_scale = 1.0; // > 1 when memory pressure enlarged the budget
+};
+
+// What to do when an object with an unfinished cleanup obligation becomes
+// unreachable. Both abort the cycle in which the violation is detected.
+enum class obligation_policy : std::uint8_t
+{
+    // Keep the violators and everything they reach as quarantine roots so
+    // that later cycles reclaim the remaining garbage. An object leaves the
+    // quarantine when its lifecycle reaches destroyed.
+    quarantine,
+    // Keep aborting every cycle until the violation is resolved.
+    strict
+};
+
+// Memory-pressure pacing. With a memory limit set, a cycle is requested once
+// live GC bytes pass start_fraction of the limit, and step budgets grow
+// linearly up to max_budget_scale as live bytes approach the limit. The
+// limit is a pacing target, not an allocation cap.
+struct pacing
+{
+    std::size_t memory_limit = 0; // 0 disables pacing
+    double start_fraction = 0.75;
+    double max_budget_scale = 8.0;
+};
+
+// Diagnostic description of a GC object or root.
+struct object_info
+{
+    const char* type_name = nullptr;
+    const char* root_label = nullptr; // set for roots that carry a label
+    std::size_t size = 0;             // block size including the header
+    lifecycle_state lifecycle = lifecycle_state::alive;
+    bool quarantined = false;
 };
 
 struct statistics
@@ -113,6 +151,12 @@ struct statistics
     duration worst_finalize{}; // longest reclaim-decision transition
     duration last_cycle_wall{}; // start to end of the last finished cycle
     std::uint64_t last_cycle_steps = 0;
+
+    // Memory and policy.
+    std::size_t peak_live_bytes = 0;
+    std::size_t memory_limit = 0;
+    std::uint64_t allocations_over_limit = 0;
+    std::size_t quarantined = 0;
 };
 
 namespace detail
@@ -120,12 +164,10 @@ namespace detail
 struct domain_access;
 }
 
-// One GC domain per engine instance. Scene graphs of every Scene in the engine
-// share it so that cross-Scene references are traced.
-//
-// M1: collect_full() is the synchronous baseline collector. The reference
-// types already route every non-null store through the insertion barrier so
-// that M2 can split marking without changing their contract.
+// A GC domain: object registry, root list, weak slot table and an
+// incremental, nonmoving mark-and-sweep collector driven from one owner
+// thread. Objects in one domain may reference each other freely; references
+// across domains are not supported.
 class GC_API domain
 {
 public:
@@ -156,6 +198,13 @@ public:
     // last one ended, even without new allocation. Zero disables it.
     void set_max_cycle_interval(duration interval) noexcept;
 
+    void set_pacing(const pacing& p) noexcept;
+    void set_obligation_policy(obligation_policy policy) noexcept;
+
+    // Diagnostics. Owner thread; not from inside trace functions.
+    void for_each_root(const std::function<void(const object_info&)>& fn) const;
+    void for_each_quarantined(const std::function<void(const object_info&)>& fn) const;
+
     [[nodiscard]] statistics stats() const;
     [[nodiscard]] phase current_phase() const noexcept { return phase_; }
 
@@ -184,6 +233,10 @@ private:
 
     bool advance_lifecycle(detail::object_header* header, lifecycle_state next);
     bool begin_cleanup_obligation(detail::object_header* header);
+    [[nodiscard]] std::vector<object_info> retention_path(const detail::object_header* target);
+    [[nodiscard]] object_info describe(const detail::object_header* header,
+                                       const char* root_label) const noexcept;
+    void release_quarantine(detail::object_header* header) noexcept;
 
     void shade(detail::object_header* header);
     [[nodiscard]] bool is_marked(const detail::object_header* header) const noexcept;
@@ -230,6 +283,7 @@ struct domain_access
         return h->owner->advance_lifecycle(h, next);
     }
     static bool begin_cleanup_obligation(object_header* h) { return h->owner->begin_cleanup_obligation(h); }
+    static std::vector<object_info> retention_path(const object_header* h) { return h->owner->retention_path(h); }
 };
 } // namespace detail
 } // namespace gc

@@ -5,6 +5,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace gc
 {
@@ -22,6 +23,13 @@ struct ref_access
     template <class T> static T* raw(const trace_ref<T>& r) noexcept { return r.ptr_; }
 
     template <class T> static root_ref<T> make_root(object_header* h, T* p) { return root_ref<T>(h, p); }
+    template <class T> static trace_ref<T> make_trace(object_header* h, T* p) { return trace_ref<T>(h, p); }
+    template <class T> static weak_ref<T> make_weak(object_header* h, T* p) noexcept
+    {
+        weak_ref<T> w;
+        w.set(h, p);
+        return w;
+    }
 };
 
 template <class From, class To>
@@ -108,6 +116,12 @@ public:
         reset();
         return *this;
     }
+
+    // Diagnostic name of the holder, reported by domain::for_each_root and
+    // retention paths. The string must outlive the root. Not copied or moved
+    // with the value.
+    void set_label(const char* label) noexcept { node_.label = label; }
+    [[nodiscard]] const char* label() const noexcept { return node_.label; }
 
     void reset() noexcept
     {
@@ -250,6 +264,8 @@ private:
     template <class> friend class trace_ref;
     friend struct detail::ref_access;
 
+    trace_ref(detail::object_header* h, T* p) { assign(h, p); }
+
     void assign(detail::object_header* h, T* p)
     {
         if (h)
@@ -317,6 +333,7 @@ public:
 
 private:
     template <class> friend class weak_ref;
+    friend struct detail::ref_access;
 
     void set(detail::object_header* h, T* p) noexcept
     {
@@ -333,4 +350,63 @@ private:
     std::uint32_t generation_ = 0;
     T* ptr_ = nullptr; // never dereferenced unless promotion succeeds
 };
+// ------------------------------------------------------------------ helpers
+
+template <class R>
+concept strong_ref = requires(const R& r) { detail::ref_access::header(r); };
+
+// Identity comparison: two strong references are equal when they refer to
+// the same GC object, whatever static type each one views it as.
+template <strong_ref A, strong_ref B>
+[[nodiscard]] bool operator==(const A& a, const B& b) noexcept
+{
+    return detail::ref_access::header(a) == detail::ref_access::header(b);
+}
+
+template <class U, class T>
+[[nodiscard]] root_ref<U> static_ref_cast(const root_ref<T>& r)
+{
+    return detail::ref_access::make_root<U>(detail::ref_access::header(r), static_cast<U*>(r.get()));
+}
+
+template <class U, class T>
+[[nodiscard]] trace_ref<U> static_ref_cast(const trace_ref<T>& r)
+{
+    return detail::ref_access::make_trace<U>(detail::ref_access::header(r), static_cast<U*>(r.get()));
+}
+
+// Returns an empty reference when the object is not a U.
+template <class U, class T>
+[[nodiscard]] root_ref<U> dynamic_ref_cast(const root_ref<T>& r)
+{
+    U* p = dynamic_cast<U*>(r.get());
+    return p ? detail::ref_access::make_root<U>(detail::ref_access::header(r), p) : root_ref<U>{};
+}
+
+template <class U, class T>
+[[nodiscard]] trace_ref<U> dynamic_ref_cast(const trace_ref<T>& r)
+{
+    U* p = dynamic_cast<U*>(r.get());
+    return p ? detail::ref_access::make_trace<U>(detail::ref_access::header(r), p) : trace_ref<U>{};
+}
+
 } // namespace gc
+
+// Hashes by object identity, consistent with operator==.
+template <class T>
+struct std::hash<gc::root_ref<T>>
+{
+    std::size_t operator()(const gc::root_ref<T>& r) const noexcept
+    {
+        return std::hash<const void*>{}(gc::detail::ref_access::header(r));
+    }
+};
+
+template <class T>
+struct std::hash<gc::trace_ref<T>>
+{
+    std::size_t operator()(const gc::trace_ref<T>& r) const noexcept
+    {
+        return std::hash<const void*>{}(gc::detail::ref_access::header(r));
+    }
+};

@@ -3,10 +3,13 @@
 #include "refs.hpp"
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace gc
 {
@@ -21,11 +24,27 @@ template <class T> struct is_optional<std::optional<T>> : std::true_type {};
 template <class T> struct is_pair : std::false_type {};
 template <class A, class B> struct is_pair<std::pair<A, B>> : std::true_type {};
 
+template <class T> struct is_variant : std::false_type {};
+template <class... Ts> struct is_variant<std::variant<Ts...>> : std::true_type {};
+
+// Exclusively owned, non-GC sub-objects (pimpl and similar). shared_ptr is
+// deliberately not traced: shared ownership would need its own convention.
+template <class T> struct is_unique_ptr : std::false_type {};
+template <class T, class D> struct is_unique_ptr<std::unique_ptr<T, D>> : std::true_type {};
+
+template <class T> consteval bool traceable();
+
+template <class... Ts>
+consteval bool any_traceable(std::variant<Ts...>*)
+{
+    return (traceable<Ts>() || ...);
+}
+
 template <class T>
 concept has_gc_trace = requires(const T& value, tracer& t) { value.gc_trace(t); };
 
 // A type is traceable when it is a trace_ref, declares gc_trace, or is an
-// optional, pair or range that contains a traceable type.
+// optional, unique_ptr, variant, pair or range that contains a traceable type.
 template <class T>
 consteval bool traceable()
 {
@@ -34,6 +53,10 @@ consteval bool traceable()
         return true;
     else if constexpr (is_optional<U>::value)
         return traceable<typename U::value_type>();
+    else if constexpr (is_unique_ptr<U>::value)
+        return !std::is_array_v<typename U::element_type> && traceable<typename U::element_type>();
+    else if constexpr (is_variant<U>::value)
+        return any_traceable(static_cast<U*>(nullptr));
     else if constexpr (is_pair<U>::value)
         return traceable<typename U::first_type>() || traceable<typename U::second_type>();
     else if constexpr (std::ranges::range<U>)
@@ -68,16 +91,28 @@ public:
         using U = std::remove_cvref_t<T>;
         static_assert(detail::traceable<U>(),
                       "gc::tracer::visit: the type holds no trace_ref. Visit trace_ref, types with gc_trace, "
-                      "or optionals, pairs and containers of them. weak_ref is never traced.");
+                      "or optionals, unique_ptrs, variants, pairs and containers of them. "
+                      "weak_ref is never traced.");
 
         if constexpr (detail::is_trace_ref<U>::value)
             mark(detail::ref_access::header(value));
         else if constexpr (detail::has_gc_trace<U>)
             value.gc_trace(*this);
-        else if constexpr (detail::is_optional<U>::value)
+        else if constexpr (detail::is_optional<U>::value || detail::is_unique_ptr<U>::value)
         {
             if (value)
                 visit(*value);
+        }
+        else if constexpr (detail::is_variant<U>::value)
+        {
+            if (value.valueless_by_exception())
+                return;
+            std::visit(
+                [&](const auto& alternative) {
+                    if constexpr (detail::traceable<decltype(alternative)>())
+                        visit(alternative);
+                },
+                value);
         }
         else if constexpr (detail::is_pair<U>::value)
         {
@@ -97,16 +132,22 @@ private:
     friend class domain;
 
     explicit tracer(domain& d) noexcept : domain_(d) {}
+    // Diagnostic mode: records edges instead of marking.
+    tracer(domain& d, std::vector<detail::object_header*>& edges) noexcept : domain_(d), collect_(&edges) {}
 
     void mark(detail::object_header* header)
     {
         if (!header)
             return;
         ++edges_;
-        domain_.shade(header);
+        if (collect_)
+            collect_->push_back(header);
+        else
+            domain_.shade(header);
     }
 
     domain& domain_;
+    std::vector<detail::object_header*>* collect_ = nullptr;
     std::size_t edges_ = 0;
 };
 } // namespace gc

@@ -1,58 +1,101 @@
 # GCCE — CreatorEngine GC
 
-CreatorEngine의 Scene, Entity, Component 메모리 수명을 관리하는 자체 GC 런타임이다. 설계와 도입 계획은 [docs/CreatorEngine_GC_Implementation_Plan.md](docs/CreatorEngine_GC_Implementation_Plan.md)에 있다.
+C++20 tracing GC 라이브러리. 명시적 루트와 정확한 추적을 사용하는 nonmoving mark-and-sweep이며, owner 스레드에서 프레임 예산만큼 나누어 수집한다. 설계 배경은 [docs/CreatorEngine_GC_Implementation_Plan.md](docs/CreatorEngine_GC_Implementation_Plan.md)에 있다.
 
-현재 단계는 **M2 GameThread 증분 수집과 자동 요청**이다. 명시적 루트와 정확한 추적을 사용하는 nonmoving mark-and-sweep을 `collect_step(budget)`으로 프레임마다 나누어 진행하고, insertion barrier가 Mark 중의 참조 변경을 보완한다. M1의 동기 수집 `collect_full()`은 로딩과 종료 경계, 그리고 정확성 비교 기준으로 유지한다.
+엔진 연동(Scene, Entity, 스크립트 핸들 등)은 이 저장소의 범위가 아니다. 이 저장소는 엔진이 사용할 GC 런타임과 그 계약만 제공한다.
 
 ## 사용 예
 
 ```cpp
 #include <gc/gc.hpp>
 
-struct Component;
+struct Item;
 
-struct Entity
+struct Inventory
 {
-    std::vector<gc::trace_ref<Component>> components; // 강한 소유 간선
-    gc::weak_ref<Entity> parent;                      // 관찰 역참조
+    std::vector<gc::trace_ref<Item>> items; // 강한 간선
+    gc::weak_ref<Inventory> parent;         // 관찰용 역참조
 
-    void gc_trace(gc::tracer& t) const { t.visit(components); }
+    void gc_trace(gc::tracer& t) const { t.visit(items); }
 };
 
-struct Component
+struct Item : gc::enable_ref_from_this<Item>
 {
-    gc::trace_ref<Entity> target; // 생존을 연장해야 하는 대상
-    void gc_trace(gc::tracer& t) const { t.visit(target); }
+    gc::trace_ref<Inventory> owner;
+    void gc_trace(gc::tracer& t) const { t.visit(owner); }
 };
 
-gc::domain domain;                                   // 엔진 인스턴스당 하나
-gc::root_ref<Entity> e = gc::make<Entity>(domain);   // 생성 스코프의 root
-e->components.push_back(gc::make<Component>(domain));
+gc::domain domain;
+gc::root_ref<Inventory> inv = gc::make<Inventory>(domain); // 외부 루트
+inv->items.push_back(gc::make<Item>(domain));
+inv->items.back()->owner = inv;                            // 순환도 회수된다
 
-gc::weak_ref<Entity> handle = e;
-e = nullptr;
+// 프레임마다 안전 구간에서
+domain.collect_step({std::chrono::microseconds(250), 16});
 
-// 엔진 루프의 안전 구간에서 매 프레임
-gc::step_result r = domain.collect_step({std::chrono::microseconds(250), 16});
+// 로딩·종료 경계에서
+domain.collect_full();
 ```
 
-## 공개 API
+## 참조 타입
 
-| 항목 | 역할 |
+| 타입 | 생존 | 사용 위치 |
+| --- | --- | --- |
+| `gc::root_ref<T>` | 대상과 그 그래프를 보존 | 스택, 전역, GC 밖의 컨테이너, 클로저. GC 객체 멤버로 쓰지 않는다 |
+| `gc::trace_ref<T>` | 소유 객체가 살아 있을 때 대상 보존 | GC 객체의 멤버. `gc_trace`에서 방문해야 한다 |
+| `gc::weak_ref<T>` | 보존하지 않음 | 관찰, 역참조, 캐시. `lock()`은 root_ref를 돌려준다 |
+
+- 기반 클래스 변환(다중·가상 상속 포함), `static_ref_cast`, `dynamic_ref_cast`를 지원한다.
+- `==`와 `std::hash`는 객체 정체성 기준이다. 정적 타입이 달라도 같은 객체면 같다.
+- `gc::enable_ref_from_this<T>`로 객체 안에서 `root_from_this()`, `weak_from_this()`를 얻는다. 생성자 안에서는 빈 참조를 돌려준다.
+- `root_ref::set_label("...")`로 루트 보유자 이름을 붙이면 진단에 표시된다.
+
+## 추적
+
+`gc_trace(gc::tracer&) const`에서 모든 강한 참조를 `t.visit(...)`로 방문한다. 직렬화 여부와 관계없이 모든 trace_ref를 방문해야 한다.
+
+`visit`이 받는 타입은 `trace_ref`, `gc_trace`를 가진 값 타입, 그리고 이들을 담은 `std::optional`, `std::unique_ptr`, `std::variant`, `std::pair`, 모든 range 컨테이너(vector, deque, list, array, map, unordered_map, set 등)이다. 추적할 참조가 없는 타입을 넘기면 컴파일 오류가 난다. `weak_ref`는 방문 대상이 아니다.
+
+추적 함수와 GC 객체의 소멸자는 할당, 수집, 게임 로직 호출을 하지 않는다. 소멸자에서 다른 GC 객체를 역참조하지 않는다.
+
+## 수집
+
+| API | 동작 |
 | --- | --- |
-| `gc::domain` | 객체 등록소, 루트 목록, 수집기, 통계와 위반 진단 |
-| `domain::collect_step(budget)` | 요청이나 최대 간격이 있을 때 사이클을 시작하고 soft budget만큼 진행 |
-| `domain::collect_full()` | 진행 중 사이클을 끝낸 뒤 새 사이클을 완료까지 실행 |
-| `domain::request_collection`, `set_allocation_threshold`, `set_max_cycle_interval` | 수명 이벤트, 할당량, 경과 시간에 따른 수집 요청 |
-| `gc::make<T>(domain, args...)` | 생성 완료 후 게시하고 `root_ref<T>` 반환 |
-| `gc::root_ref<T>` | 외부 루트. GameThread 전용이며 GC 객체 멤버로 쓰지 않는다 |
-| `gc::trace_ref<T>` | GC 객체가 보유하는 강한 간선. `gc_trace`에서 방문해야 한다 |
-| `gc::weak_ref<T>` | 비소유 참조. `lock()`은 GameThread에서만 하며 root_ref를 돌려준다 |
-| `gc::tracer::visit` | trace_ref, `gc_trace`를 가진 값, optional, pair, 컨테이너를 재귀 방문 |
-| `gc::lifecycle_of`, `gc::advance_lifecycle` | 논리적 수명 상태 조회와 한 단계 전진 |
-| `gc::begin_cleanup_obligation` | 엔진 등록 시작 표시. destroyed 전에 도달 불가가 되면 사이클 중단 |
+| `collect_step(budget)` | 요청, 최대 간격, 메모리 압력이 있을 때 사이클을 시작하고 soft budget만큼 진행 |
+| `collect_full()` | 진행 중 사이클을 끝낸 뒤 새 사이클을 완료까지 실행 |
+| `request_collection()` | 요청만 기록. 실제 진행은 다음 step |
+| `set_allocation_threshold(bytes)` | 지난 사이클 이후 할당량이 넘으면 요청 |
+| `set_max_cycle_interval(d)` | 마지막 사이클 이후 시간이 지나면 시작 |
+| `set_pacing({limit, start_fraction, max_scale})` | live 바이트가 한도의 비율을 넘으면 요청하고 step 예산을 최대 배율까지 늘림 |
 
-`gc::violation_kind`로 보고하는 위반은 잘못된 스레드의 변경, 중첩 수집, 추적 중 할당, 회수 확정 객체의 재게시, 정리 의무가 남은 객체의 도달성 상실, 종료 시 남은 root와 객체다. 기본 처리기는 메시지를 출력하고 중단한다.
+- **증분 수집:** insertion barrier로 Mark 중의 참조 변경을 보완한다. 작업 단위는 객체 하나의 trace, 소멸자 하나, 슬롯 256개 스캔이며 단위 경계에서 예산을 확인한다. 큰 컨테이너 하나나 긴 소멸자는 예산을 넘을 수 있고, 그 초과는 통계에 기록된다.
+- **회수 판정:** 남은 표시 작업 소진, 정리 의무 재확인, 할당 cutoff 고정, Sweep 진입을 한 step 안에서 수행한다. Sweep 중 생성된 객체는 회수 후보가 아니고, 후보는 저장 공간이 남아 있어도 weak 승격이 실패한다.
+
+## 논리적 수명과 정리 의무
+
+`lifecycle_state`(`alive → destroy_requested → destroying → destroyed`)는 GC 생존과 별개다. 전이는 한 단계씩 앞으로만 가며, 중복 요청은 `false`를 돌려준다.
+
+`begin_cleanup_obligation(ref)` 이후 `destroyed`에 도달하기 전에 객체가 도달 불가가 되면 `unreachable_with_cleanup_obligation`을 보고하고 그 사이클을 중단한다.
+
+| 정책 | 동작 |
+| --- | --- |
+| `obligation_policy::quarantine` (기본) | 위반 객체와 하위 그래프를 격리 루트로 보존. 다음 사이클부터 나머지 garbage는 정상 회수. `destroyed` 도달 시 격리 해제 |
+| `obligation_policy::strict` | 위반이 해소될 때까지 매 사이클 중단 |
+
+## 진단과 통계
+
+- `for_each_root`, `for_each_quarantined`: 타입, 라벨, 크기, 수명 상태 열거
+- `gc::retention_path(ref)`: 루트(라벨 포함)부터 대상까지의 강한 경로. 도달 불가면 빈 결과
+- `stats()`: 생존 객체와 바이트, 피크, 사이클 결과(표시 수, 간선 수, 회수 수, mark/sweep 시간), step 초과, 최장 작업 단위, 최장 회수 판정, barrier 실행 수, 격리 수
+
+## 위반 처리
+
+`violation_kind`: 잘못된 스레드의 변경, 중첩 수집, 추적 중 할당, 회수 확정 객체의 재게시, 정리 의무 위반, 종료 시 남은 root와 객체. 기본 처리기는 메시지를 출력하고 `abort`한다. `set_violation_handler`로 바꿀 수 있다.
+
+## 스레드 규약
+
+root 등록, 참조 저장, 할당, 수집, weak 승격은 owner 스레드에서만 한다. 다른 스레드는 weak_ref를 복사·보관할 수 있고, owner 스레드가 root로 보존하는 동안 객체를 읽을 수 있다. 데이터 경쟁 방지는 사용자 책임이다. `bind_to_current_thread()`로 owner를 옮길 수 있다.
 
 ## 빌드와 테스트
 
@@ -65,34 +108,27 @@ ctest --test-dir build --output-on-failure
 | 옵션 | 기본값 | 의미 |
 | --- | --- | --- |
 | `GCCE_BUILD_SHARED` | OFF | 런타임을 DLL/공유 라이브러리로 빌드 |
-| `GCCE_THREAD_CHECKS` | ON | owner 스레드 검사 활성화 |
-| `GCCE_BUILD_TESTS` | ON | 테스트 빌드 |
+| `GCCE_THREAD_CHECKS` | ON | owner 스레드 검사 |
+| `GCCE_BUILD_TESTS` | ON | GoogleTest 테스트 빌드 |
 
-C++20이 필요하다. CI는 MSVC Debug/Release × 정적/DLL, GCC ASan/UBSan, Clang 공유 빌드를 실행한다.
+테스트는 GoogleTest를 사용한다. 설치된 패키지가 있으면 그것을 쓰고, 없으면 FetchContent로 받는다. 오프라인이면 `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=<경로>`를 지정한다.
 
-## 검증 범위 (계획 12장)
-
-| 번호 | 상태 |
+| 파일 | 내용 |
 | --- | --- |
-| C01, C02, C07, C09, C10 | 동기 수집기로 검증 |
-| C03, C05, C06, C08 | 증분 수집의 slice 경계에서 결정적으로 재현해 검증 |
-| C04 | 사이클 사이의 컨테이너 변경을 검증. 컨테이너 내부 분할은 하지 않으므로 slice 중 cursor 문제는 없다 |
-| C12 | 동기 수집기는 독립 oracle과 비교, 증분 수집기는 무작위 변경과 slice 크기에서 오회수 없음과 안정화 후 회수를 검증 |
-| C11 | 잘못된 스레드 변경 탐지만 검증. 작업 차용 보호는 M3 이후 |
+| `refs_test` | 참조 복사·이동·재배치, 라벨, 정체성 비교, hash, 캐스트, ref_from_this |
+| `weak_test` | 만료, 승격, 슬롯 재사용 세대, 회수 중 승격 거부, 스레드 간 복사 |
+| `collection_test` | 순환, 공유 노드, 20만 단계 리스트, 다형성, 가상 상속, 정렬, 일반 멤버 소멸 |
+| `containers_test` | 표준 컨테이너·optional·variant·unique_ptr 추적, 컨테이너 변경과 알고리즘 |
+| `construction_test` | 생성자 예외, 중첩 생성, 재진입·재게시 위반, 기본 처리기 death test |
+| `lifecycle_test` | 상태 전이, 파괴된 객체의 하위 그래프, 격리·엄격 정책 |
+| `incremental_test` | barrier, 판정 직전 승격, Sweep 중 생성, 예산 초과와 barrier 비용, 요청 조건 |
+| `pacing_test` | 메모리 한도에 따른 요청과 예산 배율 |
+| `diagnostics_test` | 루트 열거, retention path, 격리 목록, 시간 통계 |
+| `threading_test` | owner 스레드 위반, owner 이동, 보존된 객체의 병렬 읽기, 독립 도메인 |
+| `shutdown_test` | 종료 시 회수, 진행 중 사이클 종료, 남은 root와 정리 의무 |
+| `scenarios_test` | 이중 연결 리스트, weak 부모를 가진 BST, 그래프, LRU 캐시, observer, 클로저 |
+| `stress_test` | seed 40개의 무작위 그래프. 전체 수집은 oracle과 정확히 일치, 증분 수집은 도달 가능 객체를 회수하지 않고 안정화 후 garbage를 남기지 않음 |
 
-증분 테스트는 barrier 제거, 판정 직전 표시 작업 재소진 제거, 할당 cutoff 제거, Mark 중 정리 의무 표시 제거의 네 가지 변형을 각각 탐지하는지 확인했다.
+barrier 제거, 판정 직전 표시 작업 재소진 제거, 할당 cutoff 제거, Mark 중 정리 의무 표시 제거, 격리 루트 스캔 제거의 다섯 가지 구현 변형을 각각 테스트가 탐지하는지 확인했다.
 
-## M1과 M2에서 정한 기준안
-
-- 객체 헤더와 객체를 한 블록에 둔다. 참조는 헤더와 타입 보정된 포인터를 함께 보관해 다중 상속의 기반 클래스 참조를 지원한다.
-- weak 슬롯 세대는 32비트로 1부터 시작한다. 최댓값에 도달한 슬롯은 재사용하지 않고 퇴역한다.
-- Gray 스택은 사이클 시작 시 생존 객체 수만큼 미리 확보하고, 슬롯 반환 목록도 미리 확보해 sweep 중에 할당하지 않는다.
-- 정리 의무 위반이 있으면 사이클 전체를 중단한다. 계획 5장의 격리 정책은 아직 구현하지 않았다.
-- 종료 시 root가 남아 있으면 보고 후 root를 분리하고 객체를 해제하지 않는다.
-- mark는 epoch 비교로 판정해 사이클마다 전체 색 초기화를 하지 않는다. epoch가 wrap되면 한 번 전체를 초기화한다.
-- root 목록은 사이클 시작 시 한 번에 스캔한다. 이후 추가되는 root는 등록 시 barrier가 표시하고, root 제거는 작업이 없다.
-- Gray가 비면 슬롯을 나누어 훑으며 정리 의무가 남은 미표시 객체를 후보로 모은다. Mark 중 새로 정리 의무가 생긴 객체는 즉시 표시해 이번 사이클에서 놓치지 않게 하고, 도달 불가라면 다음 사이클에서 보고한다.
-- 회수 판정은 한 step 안에서 남은 표시 작업 소진, 후보 재확인, 할당 cutoff 고정, Sweep 진입을 함께 수행한다. 이 시간은 `worst_finalize`로 따로 기록한다.
-- 회수 후보는 미표시이면서 cutoff 이전에 할당된 객체다. Sweep 중 생성된 객체는 같은 슬롯을 재사용해도 후보가 아니며, 후보에 대한 weak 승격과 강한 참조 저장은 저장 공간이 남아 있어도 실패하거나 위반으로 보고된다.
-- 작업 단위는 객체 하나의 trace, 소멸자 하나, 또는 슬롯 256개 스캔이다. 각 단위의 시간을 재서 최장 단위와 step 초과를 기록한다. 컨테이너 재할당에 따른 barrier 실행 수는 `barrier_stores_during_mark`로 관찰한다.
-- 메모리 압력에 따른 예산 조정은 아직 없다. M0 측정 이후 `step_budget`을 정하는 정책으로 추가한다.
+CI는 MSVC Debug/Release × 정적/DLL, GCC Debug(ASan/UBSan), Clang Release(공유 라이브러리)에서 실행한다.

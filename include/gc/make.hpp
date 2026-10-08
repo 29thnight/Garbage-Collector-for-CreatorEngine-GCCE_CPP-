@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ref_from_this.hpp"
 #include "tracer.hpp"
 
 #include <new>
@@ -59,6 +60,8 @@ template <class T, class... Args>
         detail::domain_access::abort_allocation(d, pending);
         throw;
     }
+    if constexpr (std::is_base_of_v<detail::ref_from_this_base, T>)
+        static_cast<detail::ref_from_this_base*>(object)->gc_self_header_ = pending.header;
     detail::object_header* header = detail::domain_access::publish(d, pending);
     return detail::ref_access::make_root<T>(header, object);
 }

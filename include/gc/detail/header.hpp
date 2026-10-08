@@ -47,6 +47,8 @@ struct object_header
     lifecycle_state lifecycle = lifecycle_state::alive;
     // Set once engine registration starts; cleared on reaching destroyed.
     bool cleanup_obligation = false;
+    // Held by the domain's quarantine after a cleanup-obligation violation.
+    bool quarantined = false;
 };
 
 // Intrusive node of the domain's root list, embedded in every root_ref.
@@ -55,6 +57,9 @@ struct root_node
     root_node* prev = nullptr;
     root_node* next = nullptr;
     object_header* header = nullptr;
+    // Diagnostic name of whoever holds the root. Belongs to the root_ref
+    // object, not to its value: never copied or moved.
+    const char* label = nullptr;
 };
 } // namespace detail
 } // namespace gc

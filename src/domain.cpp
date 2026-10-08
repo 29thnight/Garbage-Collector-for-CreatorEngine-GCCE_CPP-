@@ -7,6 +7,7 @@
 #include <limits>
 #include <new>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -36,6 +37,7 @@ constexpr std::size_t default_allocation_threshold = std::size_t{4} * 1024 * 102
 constexpr std::uint32_t max_generation = std::numeric_limits<std::uint32_t>::max();
 // Slots looked at per verify or sweep unit when no destructor runs.
 constexpr std::size_t slot_scan_batch = 256;
+constexpr const char* quarantine_label = "gc.quarantine";
 
 std::size_t round_up(std::size_t value, std::size_t align) noexcept
 {
@@ -98,6 +100,9 @@ struct domain::impl
     std::size_t bytes_since_last_cycle = 0;
     std::size_t allocation_threshold = default_allocation_threshold;
     duration max_cycle_interval{};
+    pacing pacing_config;
+    obligation_policy policy = obligation_policy::quarantine;
+    std::vector<detail::object_header*> quarantine;
     std::uint64_t next_serial = 0;
     unsigned construct_depth = 0;
     bool in_collection = false;
@@ -116,6 +121,8 @@ struct domain::impl
     duration worst_finalize{};
     duration last_cycle_wall{};
     std::uint64_t last_cycle_steps = 0;
+    std::size_t peak_live_bytes = 0;
+    std::uint64_t allocations_over_limit = 0;
     collect_result last;
 
     violation_handler handler = &default_violation_handler;
@@ -188,6 +195,10 @@ void domain::set_allocation_threshold(std::size_t bytes) noexcept { impl_->alloc
 
 void domain::set_max_cycle_interval(duration interval) noexcept { impl_->max_cycle_interval = interval; }
 
+void domain::set_pacing(const pacing& p) noexcept { impl_->pacing_config = p; }
+
+void domain::set_obligation_policy(obligation_policy policy) noexcept { impl_->policy = policy; }
+
 statistics domain::stats() const
 {
     const impl& s = *impl_;
@@ -212,6 +223,10 @@ statistics domain::stats() const
     st.worst_finalize = s.worst_finalize;
     st.last_cycle_wall = s.last_cycle_wall;
     st.last_cycle_steps = s.last_cycle_steps;
+    st.peak_live_bytes = s.peak_live_bytes;
+    st.memory_limit = s.pacing_config.memory_limit;
+    st.allocations_over_limit = s.allocations_over_limit;
+    st.quarantined = s.quarantine.size();
     return st;
 }
 
@@ -290,9 +305,17 @@ detail::object_header* domain::publish(pending_allocation& pending) noexcept
 
     ++s.live_objects;
     s.live_bytes += h->block_size;
+    s.peak_live_bytes = std::max(s.peak_live_bytes, s.live_bytes);
     s.bytes_since_last_cycle += h->block_size;
     if (s.bytes_since_last_cycle >= s.allocation_threshold)
         s.requested = true;
+    if (const std::size_t limit = s.pacing_config.memory_limit; limit != 0)
+    {
+        if (s.live_bytes > limit)
+            ++s.allocations_over_limit;
+        if (static_cast<double>(s.live_bytes) >= static_cast<double>(limit) * s.pacing_config.start_fraction)
+            s.requested = true;
+    }
 
     // An object completed during marking is scanned in this cycle. During
     // sweep its serial is past the cutoff, so it is never a candidate.
@@ -364,7 +387,10 @@ bool domain::advance_lifecycle(detail::object_header* header, lifecycle_state ne
         return false;
     header->lifecycle = next;
     if (next == lifecycle_state::destroyed)
+    {
         header->cleanup_obligation = false;
+        release_quarantine(header);
+    }
     return true;
 }
 
@@ -476,6 +502,8 @@ void domain::start_cycle()
     // barrier when they are linked, and removing a root needs no work.
     for (detail::root_node* n = s.roots.next; n != &s.roots; n = n->next)
         shade(n->header);
+    for (detail::object_header* h : s.quarantine)
+        shade(h);
 }
 
 bool domain::do_unit(tracer& t, step_result& r)
@@ -494,7 +522,9 @@ bool domain::do_unit(tracer& t, step_result& r)
             s.tracing = false;
             ++s.current.marked;
             s.current.edges_visited += std::exchange(t.edges_, 0);
-            s.note_unit(clock::now() - t0, r);
+            const duration d = clock::now() - t0;
+            s.current.mark_time += d;
+            s.note_unit(d, r);
             return true;
         }
         s.current_stage = stage::verify;
@@ -516,7 +546,9 @@ bool domain::do_unit(tracer& t, step_result& r)
                 if (h && h->cleanup_obligation && !is_marked(h))
                     s.suspects.push_back(h);
             }
-            s.note_unit(clock::now() - t0, r);
+            const duration d = clock::now() - t0;
+            s.current.mark_time += d;
+            s.note_unit(d, r);
             return true;
         }
         finalize(t, r);
@@ -534,7 +566,11 @@ bool domain::do_unit(tracer& t, step_result& r)
                 break; // at most one destructor per unit
             }
         }
-        s.note_unit(clock::now() - t0, r);
+        {
+            const duration d = clock::now() - t0;
+            s.current.sweep_time += d;
+            s.note_unit(d, r);
+        }
         if (s.sweep_cursor < s.sweep_end)
             return true;
         finish_cycle(true);
@@ -573,11 +609,20 @@ void domain::finalize(tracer& t, step_result& r)
         {
             report(violation_kind::unreachable_with_cleanup_obligation, h);
             ++s.current.violations;
+            if (s.policy == obligation_policy::quarantine && !h->quarantined)
+            {
+                // From the next cycle on it is a root, so its subgraph stays
+                // and the rest of the garbage is reclaimed again.
+                h->quarantined = true;
+                s.quarantine.push_back(h);
+                ++s.current.quarantined;
+            }
         }
     }
     s.suspects.clear();
 
     const duration elapsed = clock::now() - t0;
+    s.current.mark_time += elapsed;
     r.finalized = true;
     r.finalize_time = elapsed;
     s.worst_finalize = std::max(s.worst_finalize, elapsed);
@@ -656,6 +701,17 @@ step_result domain::collect_step(const step_budget& budget)
         r.cycle_started = true;
     }
 
+    // Memory pressure enlarges the budget so the cycle finishes sooner.
+    if (const std::size_t limit = s.pacing_config.memory_limit; limit != 0)
+    {
+        const double used = static_cast<double>(s.live_bytes) / static_cast<double>(limit);
+        const double from = s.pacing_config.start_fraction;
+        const double t = from < 1.0 ? std::clamp((used - from) / (1.0 - from), 0.0, 1.0) : (used >= 1.0 ? 1.0 : 0.0);
+        r.budget_scale = 1.0 + (std::max(s.pacing_config.max_budget_scale, 1.0) - 1.0) * t;
+    }
+    const auto time_budget = std::chrono::duration_cast<duration>(budget.time * r.budget_scale);
+    const auto min_units = static_cast<std::size_t>(static_cast<double>(budget.min_units) * r.budget_scale);
+
     ++s.steps;
     ++s.cycle_steps;
     tracer t(*this);
@@ -668,16 +724,14 @@ step_result domain::collect_step(const step_budget& budget)
             r.cycle_finished = true;
             break;
         }
-        if (r.units >= budget.min_units && clock::now() - start >= budget.time)
+        if (r.units >= min_units && clock::now() - start >= time_budget)
             break;
     }
 
     r.elapsed = clock::now() - start;
-    r.over_budget = r.elapsed > budget.time;
+    r.over_budget = r.elapsed > time_budget;
     s.steps_over_budget += r.over_budget;
     s.worst_step = std::max(s.worst_step, r.elapsed);
-    if (r.cycle_finished)
-        s.last_cycle_steps = s.cycle_steps;
 
     s.in_collection = false;
     r.after = phase_;
@@ -702,5 +756,94 @@ collect_result domain::collect_full()
 
     s.in_collection = false;
     return s.last;
+}
+// ------------------------------------------------------------ diagnostics
+
+object_info domain::describe(const detail::object_header* h, const char* root_label) const noexcept
+{
+    object_info info;
+    info.type_name = h->type ? h->type->name : nullptr;
+    info.root_label = root_label;
+    info.size = h->block_size;
+    info.lifecycle = h->lifecycle;
+    info.quarantined = h->quarantined;
+    return info;
+}
+
+void domain::release_quarantine(detail::object_header* header) noexcept
+{
+    if (!header->quarantined)
+        return;
+    header->quarantined = false;
+    auto& q = impl_->quarantine;
+    q.erase(std::remove(q.begin(), q.end(), header), q.end());
+}
+
+void domain::for_each_root(const std::function<void(const object_info&)>& fn) const
+{
+    const impl& s = *impl_;
+    for (const detail::root_node* n = s.roots.next; n != &s.roots; n = n->next)
+        fn(describe(n->header, n->label));
+}
+
+void domain::for_each_quarantined(const std::function<void(const object_info&)>& fn) const
+{
+    for (const detail::object_header* h : impl_->quarantine)
+        fn(describe(h, quarantine_label));
+}
+
+std::vector<object_info> domain::retention_path(const detail::object_header* target)
+{
+    impl& s = *impl_;
+    check_thread();
+    if (s.tracing)
+    {
+        report(violation_kind::allocation_during_trace, target);
+        return {};
+    }
+
+    // Breadth-first from the roots; parents record the first path found.
+    struct origin
+    {
+        const detail::object_header* parent;
+        const char* label;
+    };
+    std::unordered_map<const detail::object_header*, origin> seen;
+    std::vector<const detail::object_header*> frontier;
+    auto add_root = [&](const detail::object_header* h, const char* label) {
+        if (seen.emplace(h, origin{nullptr, label}).second)
+            frontier.push_back(h);
+    };
+    for (const detail::root_node* n = s.roots.next; n != &s.roots; n = n->next)
+        add_root(n->header, n->label);
+    for (const detail::object_header* h : s.quarantine)
+        add_root(h, quarantine_label);
+
+    std::vector<detail::object_header*> edges;
+    tracer t(*this, edges);
+    for (std::size_t i = 0; i < frontier.size() && !seen.count(target) ; ++i)
+    {
+        const detail::object_header* h = frontier[i];
+        edges.clear();
+        s.tracing = true;
+        h->type->trace(h->object, t);
+        s.tracing = false;
+        for (const detail::object_header* child : edges)
+            if (seen.emplace(child, origin{h, nullptr}).second)
+                frontier.push_back(child);
+    }
+
+    std::vector<object_info> path;
+    auto it = seen.find(target);
+    if (it == seen.end())
+        return path;
+    for (const detail::object_header* h = target; h;)
+    {
+        const origin& o = seen.at(h);
+        path.push_back(describe(h, o.label));
+        h = o.parent;
+    }
+    std::reverse(path.begin(), path.end());
+    return path;
 }
 } // namespace gc
