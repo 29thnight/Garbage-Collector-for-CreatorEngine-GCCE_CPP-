@@ -55,11 +55,46 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 
 도메인마다 전용 블록 할당자를 둔다. 블록은 객체 헤더와 객체를 함께 담는다.
 
-- 2 KiB 이하이고 정렬이 16 이하인 블록은 64 KiB 페이지를 24개 크기 클래스로 나누어 할당하고, 해제된 블록은 페이지의 free list로 재사용한다.
-- 비게 된 페이지는 클래스마다 하나만 남기고 반환한다.
-- 더 크거나 정렬이 더 큰 블록은 개별 할당한다.
-- ASan 빌드에서는 해제된 블록을 poison해 재사용 전 접근을 탐지하고, 일반 Debug 빌드에서는 0xDD로 채운다.
-- `stats().heap_committed_bytes`, `heap_pages`로 확보량을 관찰한다.
+- **크기 클래스 풀 (기본):** 2 KiB 이하이고 정렬이 16 이하인 블록은 64 KiB 페이지를 24개 크기 클래스(16 B ~ 2 KiB)로 나누어 할당한다. 같은 클래스의 타입들은 페이지를 공유하고, 해제된 블록은 페이지의 free list로 재사용한다.
+- **페이지 공급:** 페이지는 OS 가상 메모리(Linux `mmap`, Windows `VirtualAlloc`)의 2 MiB 청크에서 받고, 처음 쓸 때 commit한다. 빈 페이지는 어느 클래스든 다시 쓸 수 있다.
+- **메모리 반환:** 빈 페이지는 바로 반환하지 않고 2사이클 동안 재사용을 기다린다. 그동안 다시 쓰이지 않으면 decommit해 물리 메모리를 OS에 돌려주고, 전부 빈 청크는 unmap한다.
+- **개별 할당:** 2 KiB를 넘거나 정렬이 16보다 큰 블록은 전역 `operator new`로 할당한다.
+- **디버그 지원:** ASan 빌드에서는 해제된 블록을 poison해 재사용 전 접근을 탐지하고, 일반 Debug 빌드에서는 0xDD로 채운다.
+- **관찰:** `stats().heap_committed_bytes`, `heap_pages`, `heap_chunks`로 확보량을 본다.
+
+`domain_config{heap_kind::...}`로 힙을 고를 수 있다. 기본값 외의 두 가지는 비교용이다.
+
+| `heap_kind` | 블록 출처 |
+| --- | --- |
+| `size_class_pools` (기본) | 크기 클래스별 풀 |
+| `per_type_pools` | 타입별 풀. 크기가 정확하지만 타입마다 최소 한 페이지가 필요하다 |
+| `system` | 모든 블록을 전역 `operator new`로 할당 |
+
+### 힙 비교 결과
+
+`-DGCCE_BUILD_BENCHMARKS=ON`으로 `gcce_allocator_bench`(할당자 단독)와 `gcce_bench`(GC 전체)를 빌드한다. 아래는 Linux x86-64, GCC 14 Release, glibc malloc 기준 수치다. CI의 Release job도 같은 벤치마크를 실행해 MSVC 힙 기준 수치를 로그에 남긴다.
+
+할당자 단독(100만 블록, 실제 GC 블록 크기 분포, ns/op):
+
+| | 할당 | 무작위 해제 | 해제 후 재할당 | 전체 해제 |
+| --- | --- | --- | --- | --- |
+| 크기 클래스 | 10 | 86 | 70 | 22 |
+| 타입별 | 12 | 89 | 76 | 23 |
+| 시스템 | 87 | 245 | 308 | 191 |
+
+GC 전체:
+
+| 시나리오 | 크기 클래스 | 타입별 | 시스템 |
+| --- | --- | --- | --- |
+| 할당 / 회수 (ns/객체, 100만 개) | 102 / 111 | 101 / 109 | 116 / 136 |
+| Mark (ns/객체, 50만 개 생존 그래프) | 409 | 414 | 460 |
+| 프레임 churn p50 / p99 (ms, 20만 개 생존, 프레임당 3000개 할당) | 3.85 / 5.41 | 3.86 / 5.03 | 4.78 / 6.18 |
+| 프레임 churn 종료 시 RSS | 127 MiB | 122 MiB | 272 MiB |
+| 200개 타입, 6000개 객체의 commit | 3.2 MiB | 12.7 MiB | 2.6 MiB |
+
+- **기본값 판단:** 크기 클래스 풀은 모든 시나리오에서 시스템 할당자보다 빠르거나 같다. 특히 해제·재할당과 장시간 churn의 메모리에서 차이가 크다. 시스템 할당자는 해제된 메모리를 돌려주지 못하고 단편화된다.
+- **타입별 풀:** 객체가 많은 타입에서는 크기 클래스와 비슷하고 메모리가 약간 적다. 그러나 객체가 적은 타입이 많으면 타입마다 페이지 하나씩 commit해 수 배를 쓴다. 그래서 기본값은 크기 클래스 풀이다.
+- **공통 한계:** 객체가 무작위로 90% 해제되는 경우에는 어느 힙도 RSS가 줄지 않는다. 객체를 옮기지 않는 GC에서는 페이지마다 생존 객체가 남기 때문이다.
 
 ## 참조 타입
 
@@ -136,6 +171,7 @@ ctest --test-dir build --output-on-failure
 | `GCCE_BUILD_SHARED` | OFF | 런타임을 DLL/공유 라이브러리로 빌드 |
 | `GCCE_THREAD_CHECKS` | ON | owner 스레드 검사 |
 | `GCCE_BUILD_TESTS` | ON | GoogleTest 테스트 빌드 |
+| `GCCE_BUILD_BENCHMARKS` | OFF | 힙 비교 벤치마크 빌드 |
 
 테스트는 GoogleTest를 사용한다. 설치된 패키지가 있으면 그것을 쓰고, 없으면 FetchContent로 받는다. 오프라인이면 `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=<경로>`를 지정한다.
 
@@ -154,7 +190,7 @@ ctest --test-dir build --output-on-failure
 | `shutdown_test` | 종료 시 회수, 진행 중 사이클 종료, 남은 root와 정리 의무 |
 | `scenarios_test` | 이중 연결 리스트, weak 부모를 가진 BST, 그래프, LRU 캐시, observer, 클로저 |
 | `managed_test` | 모든 할당 형태의 컴파일 차단(정적 검사), 다형 타입 동작, `delete this` death test |
-| `allocator_test` | 페이지 할당, 블록 재사용, 빈 페이지 반환, 큰 객체, 정렬, 주소 중복 없음 |
+| `allocator_test` | 페이지 할당, 블록 재사용, 빈 페이지의 다른 크기 재사용, 2사이클 뒤 OS 반환, 큰 객체, 정렬, 주소 중복 없음, 세 힙에서 같은 작업의 내용 무결성 |
 | `compile_fail/` | `new`, `new[]`, nothrow, placement, `delete`, `unique_ptr`, 비관리 타입 `make`가 빌드 실패하는지 확인. 각 경우마다 문제 줄만 뺀 대조 빌드가 성공해야 한다 |
 | `stress_test` | seed 40개의 무작위 그래프. 전체 수집은 oracle과 정확히 일치, 증분 수집은 도달 가능 객체를 회수하지 않고 안정화 후 garbage를 남기지 않음 |
 
