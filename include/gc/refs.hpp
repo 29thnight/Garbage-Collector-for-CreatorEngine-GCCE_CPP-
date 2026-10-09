@@ -291,9 +291,11 @@ private:
 // Non-owning reference. Promotion with lock() yields a root_ref, which means
 // the memory is protected; whether the engine may still use the object is a
 // separate lifecycle check. Promotion touches the root registry, so it is
-// owner-thread only; other threads may store and copy weak_refs.
-// The domain must outlive every weak_ref that is still locked or expired-checked;
-// with debug checks, use after the domain is gone is reported.
+// owner-thread only. Converting between weak_ref types (including adding const)
+// promotes before adjusting the pointer and is also owner-thread only; expired
+// sources yield empty references. Other threads may copy the same weak_ref type.
+// The domain must outlive every weak_ref that is still promoted, cross-type
+// converted, or expired-checked; debug checks report use after the domain is gone.
 template <class T>
 class weak_ref
 {
@@ -318,10 +320,13 @@ public:
     }
 
     template <class U>
-        requires detail::ref_convertible<U, T>
-    weak_ref(const weak_ref<U>& w) noexcept
-        : domain_(w.domain_), domain_id_(w.domain_id_), slot_(w.slot_), generation_(w.generation_), ptr_(w.ptr_)
+        requires detail::ref_convertible<U, T> && (!std::same_as<U, T>)
+    weak_ref(const weak_ref<U>& w)
     {
+        // A virtual-base adjustment may read the object's vptr. Do not touch
+        // the stored pointer until promotion protects the object's memory.
+        auto r = w.lock();
+        set(detail::ref_access::header(r), detail::ref_access::raw(r));
     }
 
     [[nodiscard]] root_ref<T> lock() const
