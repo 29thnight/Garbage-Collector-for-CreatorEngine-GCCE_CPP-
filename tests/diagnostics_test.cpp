@@ -114,4 +114,38 @@ TEST(Diagnostics, CycleTimingIsRecorded)
     EXPECT_EQ(r.reclaimed, 1000u);
     EXPECT_GT(r.mark_time.count() + r.sweep_time.count(), 0);
     EXPECT_GE(d.stats().worst_finalize.count(), 0);
+    EXPECT_GE(r.mark_time, r.startup_time);
+    EXPECT_GE(d.stats().last_cycle_wall, r.mark_time + r.sweep_time + r.maintenance_time);
+}
+
+TEST(Diagnostics, StepTimingSeparatesStartupAndIncludesMaintenance)
+{
+    gc::domain d;
+    std::vector<gc::root_ref<node>> keep;
+    for (int i = 0; i < 100; ++i)
+        keep.push_back(gc::make<node>(d, i));
+    d.request_collection();
+    auto r = d.collect_step(gctest::one_unit);
+    ASSERT_TRUE(r.cycle_started);
+    ASSERT_FALSE(r.cycle_finished);
+    EXPECT_EQ(r.startup_time, d.stats().current.startup_time);
+    EXPECT_EQ(r.longest_unit, r.longest_batch);
+    EXPECT_GE(r.elapsed, r.startup_time + r.longest_batch);
+    EXPECT_EQ(r.maintenance_time, gc::duration::zero());
+
+    while (!r.cycle_finished)
+    {
+        r = d.collect_step({gc::duration::zero(), 16});
+        EXPECT_EQ(r.startup_time, gc::duration::zero());
+        EXPECT_EQ(r.longest_unit, r.longest_batch);
+        EXPECT_GE(d.stats().worst_batch, r.longest_batch);
+        EXPECT_EQ(d.stats().worst_unit, d.stats().worst_batch);
+    }
+    const auto st = d.stats();
+    EXPECT_TRUE(st.last.completed);
+    EXPECT_EQ(r.maintenance_time, st.last.maintenance_time);
+    EXPECT_GE(r.elapsed, r.maintenance_time);
+    EXPECT_GE(r.longest_batch, r.maintenance_time);
+    EXPECT_GE(st.last.mark_time, st.last.startup_time);
+    EXPECT_GE(st.last_cycle_wall, st.last.mark_time + st.last.sweep_time + st.last.maintenance_time);
 }

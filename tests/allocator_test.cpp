@@ -1,8 +1,10 @@
 #include "support.hpp"
+#include "../src/block_allocator_testing.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <random>
 #include <unordered_set>
 #include <vector>
@@ -24,7 +26,121 @@ struct alignas(64) aligned64 : gc::managed
 };
 
 constexpr std::size_t page = 64 * 1024;
+
+using allocator_failure = gc::detail::allocator_failure;
+
+class allocator_fault_scope
+{
+public:
+    gc::detail::allocator_test_state state;
+
+    allocator_fault_scope() : previous_(gc::detail::set_allocator_test_state(&state)) {}
+    ~allocator_fault_scope() { gc::detail::set_allocator_test_state(previous_); }
+
+    allocator_fault_scope(const allocator_fault_scope&) = delete;
+    allocator_fault_scope& operator=(const allocator_fault_scope&) = delete;
+
+private:
+    gc::detail::allocator_test_state* previous_;
+};
+
+class AllocatorFailures : public ::testing::TestWithParam<allocator_failure>
+{
+};
 } // namespace
+
+// Each injection precedes a genuinely throwing transaction step. Mapping
+// counters distinguish a full rollback from merely hiding leaked storage.
+TEST_P(AllocatorFailures, FirstAllocationRollsBackAndCanBeRetried)
+{
+    allocator_fault_scope fault;
+    {
+        gc::domain d;
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            fault.state.fail_at = GetParam();
+            EXPECT_THROW((void)gc::make<node>(d, 7), std::bad_alloc);
+            EXPECT_EQ(fault.state.fail_at, allocator_failure::none);
+            const auto after = d.stats();
+            EXPECT_EQ(after.heap_chunks, 0u);
+            EXPECT_EQ(after.heap_pages, 0u);
+            EXPECT_EQ(after.heap_committed_bytes, 0u);
+            EXPECT_EQ(after.live_objects, 0u);
+            EXPECT_EQ(after.live_bytes, 0u);
+            EXPECT_EQ(after.roots, 0u);
+            EXPECT_EQ(fault.state.chunk_maps, fault.state.chunk_unmaps);
+        }
+
+        auto root = gc::make<node>(d, 42);
+        EXPECT_EQ(root->id, 42);
+        EXPECT_EQ(d.stats().heap_chunks, 1u);
+        EXPECT_EQ(d.stats().heap_pages, 1u);
+        EXPECT_EQ(fault.state.chunk_maps, fault.state.chunk_unmaps + 1);
+        d.collect_full();
+        EXPECT_EQ(live(d), 1u);
+        root = nullptr;
+        d.collect_full();
+        EXPECT_EQ(live(d), 0u);
+        EXPECT_EQ(d.stats().heap_pages, 0u);
+    }
+    EXPECT_EQ(fault.state.chunk_maps, fault.state.chunk_unmaps);
+}
+
+TEST_P(AllocatorFailures, GrowthFailurePreservesExistingStorage)
+{
+    allocator_fault_scope fault;
+    {
+        gc::domain d;
+        std::vector<gc::root_ref<sized<1900>>> keep;
+        keep.reserve(4096);
+        keep.push_back(gc::make<sized<1900>>(d));
+        keep.front()->bytes[0] = 73;
+        fault.state.fail_at = GetParam();
+
+        bool failed = false;
+        // A page holds at most 34 objects of this size; 4096 is well past
+        // one 32-page chunk, without depending on the private page header.
+        for (int i = 0; i < 4095 && !failed; ++i)
+        {
+            const auto before = d.stats();
+            try
+            {
+                keep.push_back(gc::make<sized<1900>>(d));
+            }
+            catch (const std::bad_alloc&)
+            {
+                failed = true;
+                EXPECT_EQ(fault.state.fail_at, allocator_failure::none);
+                const auto after = d.stats();
+                EXPECT_EQ(after.heap_chunks, before.heap_chunks);
+                EXPECT_EQ(after.heap_pages, before.heap_pages);
+                EXPECT_EQ(after.heap_committed_bytes, before.heap_committed_bytes);
+                EXPECT_EQ(after.live_objects, before.live_objects);
+                EXPECT_EQ(after.live_bytes, before.live_bytes);
+                EXPECT_EQ(after.roots, before.roots);
+            }
+        }
+        ASSERT_TRUE(failed);
+        EXPECT_EQ(fault.state.chunk_maps, fault.state.chunk_unmaps + 1);
+        EXPECT_EQ(keep.front()->bytes[0], 73);
+        keep.push_back(gc::make<sized<1900>>(d));
+        d.collect_full();
+        EXPECT_EQ(live(d), keep.size());
+        EXPECT_EQ(keep.front()->bytes[0], 73);
+        keep.clear();
+        d.collect_full();
+        EXPECT_EQ(live(d), 0u);
+        EXPECT_EQ(d.stats().heap_pages, 0u);
+    }
+    EXPECT_EQ(fault.state.chunk_maps, fault.state.chunk_unmaps);
+}
+
+INSTANTIATE_TEST_SUITE_P(TransactionSteps, AllocatorFailures,
+                        ::testing::Values(allocator_failure::chunk_metadata,
+                                          allocator_failure::chunk_mapping,
+                                          allocator_failure::chunk_vector,
+                                          allocator_failure::chunk_index,
+                                          allocator_failure::page_commit));
 
 TEST(Allocator, SmallObjectsComeFromPages)
 {
@@ -175,6 +291,45 @@ TEST_P(HeapKinds, WorkloadKeepsObjectsIntact)
 
 INSTANTIATE_TEST_SUITE_P(All, HeapKinds,
                          ::testing::Values(gc::heap_kind::size_class_pools, gc::heap_kind::system));
+
+#if GC_DEBUG_CHECKS
+TEST_P(HeapKinds, IndividualTrackingFailureRollsBackAndCanBeRetried)
+{
+    allocator_fault_scope fault;
+    gc::domain d(gc::domain_config{GetParam()});
+    auto existing = gc::make<node>(d, 19);
+    const auto before = d.stats();
+
+    // Large allocations exercise plain new in system mode and aligned new
+    // in pooled mode; the over-aligned case always uses aligned new.
+    fault.state.fail_at = allocator_failure::individual_index;
+    EXPECT_THROW((void)gc::make<sized<100000>>(d), std::bad_alloc);
+    EXPECT_EQ(fault.state.fail_at, allocator_failure::none);
+    EXPECT_EQ(d.stats().heap_committed_bytes, before.heap_committed_bytes);
+    EXPECT_EQ(d.stats().live_objects, before.live_objects);
+    EXPECT_EQ(d.stats().live_bytes, before.live_bytes);
+
+    fault.state.fail_at = allocator_failure::individual_index;
+    EXPECT_THROW((void)gc::make<aligned64>(d), std::bad_alloc);
+    EXPECT_EQ(fault.state.fail_at, allocator_failure::none);
+    EXPECT_EQ(d.stats().heap_committed_bytes, before.heap_committed_bytes);
+    EXPECT_EQ(d.stats().live_objects, before.live_objects);
+    EXPECT_EQ(d.stats().roots, before.roots);
+
+    auto large = gc::make<sized<100000>>(d);
+    auto aligned = gc::make<aligned64>(d);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(aligned.get()) % 64, 0u);
+    EXPECT_EQ(aligned->v, 64);
+    EXPECT_EQ(existing->id, 19);
+    d.collect_full();
+    EXPECT_EQ(live(d), 3u);
+    large = nullptr;
+    aligned = nullptr;
+    d.collect_full();
+    EXPECT_EQ(d.stats().heap_committed_bytes, before.heap_committed_bytes);
+    EXPECT_EQ(live(d), 1u);
+}
+#endif
 
 TEST(Allocator, MixedSizesAndLargeObjects)
 {

@@ -60,7 +60,7 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 - **메모리 반환:** 빈 페이지는 바로 반환하지 않고 2사이클 동안 재사용을 기다린다. 그동안 다시 쓰이지 않으면 decommit해 물리 메모리를 OS에 돌려주고, 전부 빈 청크는 unmap한다.
 - **개별 할당:** 2 KiB를 넘거나 정렬이 16보다 큰 블록은 전역 `operator new`로 할당한다.
 - **디버그 지원:** ASan 빌드에서는 해제된 블록을 poison해 재사용 전 접근을 탐지하고, 일반 Debug 빌드에서는 0xDD로 채운다.
-- **관찰:** `stats().heap_committed_bytes`, `heap_pages`, `heap_chunks`로 확보량을 본다.
+- **관찰:** `stats().heap_committed_bytes`, `heap_pages`, `heap_chunks`로 확보량을 본다. `heap_committed_bytes`는 commit된 풀 페이지와 개별 할당 블록의 바이트 합이며, 프로세스 RSS나 예약된 가상 주소 공간의 크기가 아니다.
 
 `domain_config{heap_kind::system}`로 모든 블록을 전역 `operator new`로 보내는 비교용 힙을 고를 수 있다. 기본값은 `heap_kind::size_class_pools`다.
 
@@ -76,7 +76,7 @@ GC 타입은 `gc::managed`를 상속하고 `gc::make`로만 생성한다. 소멸
 | 프레임 churn p50 / p99 (ms) | 1.93 / 4.31 | 2.74 / 5.02 | 1.80 / 2.48 | 2.01 / 2.61 |
 | 프레임 churn 종료 시 RSS | 100 MiB | 272 MiB | 49 MiB | 53 MiB |
 
-Linux는 x86-64, GCC 14 Release, glibc malloc 기준이며 수집기 최적화(아래) 이후에 측정했다. Windows는 GitHub Actions `windows-latest`, MSVC Release, 기본 힙 기준이며, 절반 규모로 수집기 최적화 이전에 측정했다. 두 힙의 상대 비교는 같은 조건끼리만 의미가 있다.
+Linux는 x86-64, GCC 14 Release, glibc malloc 기준이며 수집기 최적화(아래) 이후에 측정했다. Windows는 GitHub Actions `windows-latest`, MSVC Release, 기본 힙 기준이며, 절반 규모로 수집기 최적화 이전에 측정했다. 두 힙의 상대 비교는 같은 조건끼리만 의미가 있다. 이 수치는 기존 측정의 예시이며 이번 하드닝 변경 후 벤치마크를 다시 실행하지 않았다. 성능과 메모리 사용량은 워크로드, 플랫폼, 할당자와 실행 환경에 따라 달라진다.
 
 ### 수집기 최적화
 
@@ -89,9 +89,9 @@ Linux 벤치마크(절반 규모)에서 다음 변경의 효과를 측정했다.
 | `gc::make`의 root 등록에서 중복 검사 제거, Release에서 디버그 검사 끔 | 할당 100 → 84 ns/객체 |
 | 결과 | 프레임 churn p50 2.2 → 1.0~1.5 ms, 같은 프레임 수에서 완료한 사이클 24 → 56 |
 
-- **크기 클래스 풀:** 모든 시나리오에서 시스템 할당자보다 빠르거나 같다. 특히 해제 후 재할당과, glibc에서 장시간 churn의 메모리 사용량에서 차이가 크다.
+- **크기 클래스 풀:** 위 측정에서는 시스템 할당자보다 빠르거나 비슷했다. 특히 해제 후 재할당과, glibc에서 장시간 churn의 메모리 사용량에서 차이가 컸으며, 모든 워크로드에서의 우위를 보장하지 않는다.
 - **타입별 풀(채택하지 않음):** 타입마다 고정 크기 풀을 두는 방식도 측정했다. 객체가 많은 타입에서는 크기 클래스 풀과 비슷했지만, 객체가 적은 타입이 많으면(200개 타입, 객체 6000개) 타입마다 페이지를 하나씩 commit해 크기 클래스 풀의 약 4배(12.7 MiB 대 3.2 MiB)를 썼다.
-- **공통 한계:** 객체가 무작위로 90% 해제되는 경우에는 어느 힙도 RSS가 줄지 않는다. 객체를 옮기지 않는 GC에서는 페이지마다 생존 객체가 남기 때문이다.
+- **공통 한계:** 위 측정에서 객체가 무작위로 90% 해제되는 경우에는 어느 힙도 RSS가 줄지 않았다. 객체를 옮기지 않는 GC에서는 페이지마다 생존 객체가 남으면 메모리 반환이 제한된다.
 
 ## 참조 타입
 
@@ -105,6 +105,7 @@ Linux 벤치마크(절반 규모)에서 다음 변경의 효과를 측정했다.
 - `==`와 `std::hash`는 객체 정체성 기준이다. 정적 타입이 달라도 같은 객체면 같다.
 - 모든 GC 객체는 멤버 함수 안에서 `root_from_this()`, `weak_from_this()`로 자기 참조를 얻는다. deducing this로 호출한 타입 그대로의 참조가 나오므로, 다중 상속 객체의 기반 클래스 멤버 함수에서는 그 기반 타입으로 보정된 참조가, const 객체에서는 `root_ref<const T>`가 나온다. 생성자 안, 복사본, `gc::make`로 만들지 않은 인스턴스에서는 빈 참조다.
 - `root_ref::set_label("...")`로 루트 보유자 이름을 붙이면 진단에 표시된다.
+- 같은 타입의 `weak_ref` 복사·대입은 `noexcept`이며 객체를 승격하지 않는다. 다른 타입으로의 변환(`const` 추가 포함)은 owner 스레드에서 `lock()`으로 생존을 확인한 뒤 포인터를 보정하며, 승격 실패 시 빈 참조가 된다. 이 변환은 `noexcept`가 아니며 Mark 중에는 일시적인 root 등록으로 표시·보존에 영향을 줄 수 있다.
 
 ## 추적
 
@@ -112,7 +113,7 @@ Linux 벤치마크(절반 규모)에서 다음 변경의 효과를 측정했다.
 
 `visit`이 받는 타입은 `trace_ref`, `gc_trace`를 가진 값 타입, 그리고 이들을 담은 `std::optional`, `std::unique_ptr`, `std::variant`, `std::pair`, 모든 range 컨테이너(vector, deque, list, array, map, unordered_map, set 등)이다. 추적할 참조가 없는 타입을 넘기면 컴파일 오류가 난다. `weak_ref`는 방문 대상이 아니다.
 
-추적 함수와 GC 객체의 소멸자는 할당, 수집, 게임 로직 호출을 하지 않는다. 소멸자에서 다른 GC 객체를 역참조하지 않는다.
+추적 함수와 GC 객체의 소멸자는 할당, 수집, 게임 로직 호출을 하지 않는다. `gc_trace`는 예외를 던지지 않도록 작성하며, 소멸자와 위반 처리기는 예외를 던지면 안 된다. 소멸자에서 다른 GC 객체를 역참조하지 않는다.
 
 ## 수집
 
@@ -125,8 +126,9 @@ Linux 벤치마크(절반 규모)에서 다음 변경의 효과를 측정했다.
 | `set_max_cycle_interval(d)` | 마지막 사이클 이후 시간이 지나면 시작 |
 | `set_pacing({limit, start_fraction, max_scale})` | live 바이트가 한도의 비율을 넘으면 요청하고 step 예산을 최대 배율까지 늘림 |
 
-- **증분 수집:** insertion barrier로 Mark 중의 참조 변경을 보완한다. 작업 단위는 객체 하나의 trace, 소멸자 하나, 슬롯 256개 스캔이며 단위 경계에서 예산을 확인한다. 큰 컨테이너 하나나 긴 소멸자는 예산을 넘을 수 있고, 그 초과는 통계에 기록된다.
+- **증분 수집:** insertion barrier로 Mark 중의 참조 변경을 보완한다. 작업 단위는 객체 하나의 trace, 소멸자 하나, 최대 슬롯 256개 스캔이며, 시계는 보통 8단위의 배치 또는 무거운 단위 뒤에 확인한다. 시간 예산은 hard deadline이 아니다. 분할하지 않는 사이클 시작 작업(루트 스캔·용량 확보·epoch 초기화), 큰 trace나 긴 소멸자, 회수 판정, 사이클 종료 시 할당자 유지보수, 샘플링 간격과 `min_units` 때문에 예산을 넘을 수 있고, 그 초과는 통계에 기록된다.
 - **회수 판정:** 남은 표시 작업 소진, 정리 의무 재확인, 할당 cutoff 고정, Sweep 진입을 한 step 안에서 수행한다. Sweep 중 생성된 객체는 회수 후보가 아니고, 후보는 저장 공간이 남아 있어도 weak 승격이 실패한다.
+- **예외:** `collect_step()`·`collect_full()`에서 예외가 발생하면 진행 중 사이클을 중단으로 기록하고, 부분 표시 작업을 버리고 수집·추적 가드를 복구한 뒤 예외를 다시 던진다. 불완전한 표시 결과로 회수를 시작하지 않으며 idle 상태에서 새 사이클을 요청해 이후 다시 수집할 수 있다. `domain` 소멸자는 `noexcept`이므로 종료 수집에서 예외가 빠져나오면 `std::terminate`될 수 있다.
 
 ## 논리적 수명과 정리 의무
 
@@ -139,11 +141,15 @@ Linux 벤치마크(절반 규모)에서 다음 변경의 효과를 측정했다.
 | `obligation_policy::quarantine` (기본) | 위반 객체와 하위 그래프를 격리 루트로 보존. 다음 사이클부터 나머지 garbage는 정상 회수. `destroyed` 도달 시 격리 해제 |
 | `obligation_policy::strict` | 위반이 해소될 때까지 매 사이클 중단 |
 
+위 정책의 후속 동작은 위반 처리기가 반환할 때 적용된다. 기본 위반 처리기는 `abort`하므로, 프로세스 종료 없이 격리를 사용하려면 예외를 던지지 않고 반환하는 사용자 처리기를 `set_violation_handler`로 설정해야 한다.
+
 ## 진단과 통계
 
 - `for_each_root`, `for_each_quarantined`: 타입, 라벨, 크기, 수명 상태 열거
 - `gc::retention_path(ref)`: 루트(라벨 포함)부터 대상까지의 강한 경로. 도달 불가면 빈 결과
-- `stats()`: 생존 객체와 바이트, 피크, 사이클 결과(표시 수, 간선 수, 회수 수, mark/sweep 시간), step 초과, 최장 작업 단위, 최장 회수 판정, barrier 실행 수, 격리 수
+- `stats()`: 생존 객체와 바이트, 피크, 사이클 결과(표시 수, 간선 수, 회수 수, mark/sweep 시간), step 초과, 최장 샘플링 배치, 최장 회수 판정, barrier 실행 수, 격리 수
+- `step_result::longest_batch`·`statistics::worst_batch`는 `collect_step`의 시계 확인 사이의 배치 시간이다. 회수 판정과 사이클 종료 유지보수가 포함될 수 있으며, 객체 하나의 trace나 소멸자 시간으로 해석하면 안 된다. 기존 `longest_unit`·`worst_unit`은 같은 값을 유지하는 호환 필드다.
+- `step_result`·`collect_result`의 `startup_time`은 배치에서 분리한 사이클 시작 시간이며 사이클의 `mark_time`에 포함된다. `maintenance_time`은 종료 정리와 할당자 유지보수 시간으로 mark/sweep 시간과 별도다. 유지보수는 마지막 샘플링 배치와 step의 `elapsed`, 사이클의 `last_cycle_wall`에 포함된다.
 
 ## 위반 처리
 
@@ -155,16 +161,18 @@ Linux 벤치마크(절반 규모)에서 다음 변경의 효과를 측정했다.
 
 | 위반 | 탐지 방법 |
 | --- | --- |
-| `wrong_thread` | owner 스레드가 아닌 곳에서 root 등록, 참조 저장, 할당, 수집, weak 승격 |
+| `wrong_thread` | owner 스레드가 아닌 곳에서 root 등록, 참조 저장, 할당, 수집, weak 승격·만료 조회·다른 타입으로의 weak 변환 |
 | `created_outside_make` | `gc::managed` 생성자가 `gc::make`의 생성 범위 밖에서 실행됨. 스택·전역 인스턴스와 복사본, GC 객체 안에 값으로 둔 GC 타입 |
 | `root_inside_gc_object` | `root_ref`가 등록될 때 그 주소가 살아 있는 GC 객체 안에 있음 |
-| `weak_ref_outlived_domain` | 파괴된 도메인의 `weak_ref`를 `lock()`·`expired()`함. 프로세스 전역 도메인 등록부로 확인해 해제된 메모리를 읽지 않고 빈 참조를 돌려준다 |
+| `weak_ref_outlived_domain` | 파괴된 도메인의 `weak_ref`를 `lock()`·`expired()`하거나 다른 타입으로 변환함. 프로세스 전역 도메인 등록부로 확인하며, 처리기가 반환하면 해제된 메모리를 읽지 않고 빈 참조(`expired()`는 `true`)를 돌려준다 |
 
 도메인에 속하지 않는 위반(도메인 밖의 `created_outside_make`, `weak_ref_outlived_domain`)은 `gc::set_global_violation_handler`로 받는다.
 
+이 검사는 계약 위반 진단용이다. Release에서도 도메인은 그 도메인의 `weak_ref`보다 오래 살아야 하며, 도메인 파괴 후 `lock()`·`expired()`·다른 타입으로의 변환은 지원하지 않는다. Debug의 진단과 빈 참조 반환을 Release의 안전 보장으로 간주하면 안 된다.
+
 ## 작업 스레드에 객체 넘기기
 
-`gc::pinned<T>`는 작업 스레드가 raw pointer로 객체를 쓰는 동안 그 객체를 보존하는 이동 전용 root다. owner 스레드에서 만들고, 작업이 끝난 뒤 owner 스레드에서 해제한다. `for_each_root`와 retention path에 `gc.pinned` 라벨로 나타난다.
+`gc::pinned<T>`는 작업 스레드가 raw pointer로 객체를 쓰는 동안 그 객체를 보존하는 이동 전용 root다. wrapper 자체의 생성·이동·해제·소멸은 owner 스레드에서 한다. 작업 스레드에는 owner에서 얻은 raw pointer만 전달하고, 작업 완료를 동기화한 뒤 pin을 해제한다. pin은 메모리 수명만 보존하므로 객체 변경과의 동기화와 데이터 경쟁 방지는 별도로 필요하다. `for_each_root`와 retention path에 `gc.pinned` 라벨로 나타난다.
 
 ```cpp
 gc::pinned<Mesh> pin(mesh);
@@ -175,11 +183,11 @@ pin.release();
 
 ## 모듈(DLL) 언로드
 
-GC 객체는 자기 타입을 인스턴스화한 모듈의 코드(`gc_trace`, 소멸자)를 실행하므로, 그 모듈의 객체가 남아 있는 동안 모듈을 내리면 안 된다. `domain::objects_in_module(address)`는 주어진 주소가 속한 모듈에서 온 타입의 살아 있는 객체 수를 센다. 모듈의 객체를 놓고 `collect_full()`을 실행해 0이 된 뒤 언로드한다. 모듈은 타입 정보의 주소로 판별한다(Linux `dladdr`, Windows `GetModuleHandleEx`).
+GC 객체는 자기 타입을 인스턴스화한 모듈의 코드(`gc_trace`, 소멸자)를 실행하므로, 그 모듈의 객체가 남아 있는 동안 모듈을 내리면 안 된다. `domain::objects_in_module(address)`는 주어진 주소가 속한 모듈에서 온 타입의 살아 있는 객체 수를 센다. 모듈은 타입 정보의 주소로 판별한다(Linux `dladdr`, Windows `GetModuleHandleEx`). 모듈의 객체를 놓고 `collect_full()`을 실행한 뒤 관련된 모든 도메인에서 유효한 모듈 주소로 개수가 0인지 확인한다. 이는 GC 객체 관점의 필요조건일 뿐 완전한 언로드 안전성 증명은 아니다. 실행 중인 스레드·작업, 등록된 콜백, 외부 참조, 타입 정보와 실행·할당·해제 코드의 DLL 소유권 등도 호출자가 별도로 정리·확인해야 한다. 주소의 모듈을 식별하지 못해도 0이 반환될 수 있다.
 
 ## 스레드 규약
 
-root 등록, 참조 저장, 할당, 수집, weak 승격은 owner 스레드에서만 한다. 다른 스레드는 weak_ref를 복사·보관할 수 있고, owner 스레드가 root로 보존하는 동안 객체를 읽을 수 있다. 데이터 경쟁 방지는 사용자 책임이다. `bind_to_current_thread()`로 owner를 옮길 수 있다.
+root 등록·해제, 참조 저장, 할당, 수집, weak의 `lock()`·`expired()`와 다른 타입으로의 변환은 owner 스레드에서만 한다. 다른 스레드는 같은 타입의 `weak_ref`를 복사·보관할 수 있고, owner 스레드가 root로 보존하는 동안 객체를 읽을 수 있다. 이 허용은 다른 타입으로의 변환이나 동일한 참조 인스턴스의 동시 변경을 허용하지 않는다. 데이터 경쟁 방지는 사용자 책임이다. `bind_to_current_thread()`로 owner를 옮길 수 있으며, 이전 owner의 접근이 끝났음을 먼저 동기화해야 한다.
 
 ## 빌드와 테스트
 
@@ -225,4 +233,4 @@ ctest --test-dir build --output-on-failure
 
 barrier 제거, 판정 직전 표시 작업 재소진 제거, 할당 cutoff 제거, Mark 중 정리 의무 표시 제거, 격리 루트 스캔 제거, epoch wrap 처리 제거, 퇴역 슬롯 재사용의 일곱 가지 구현 변형을 각각 테스트가 탐지하는지 확인했다.
 
-CI는 MSVC Debug/Release × 정적/DLL, GCC Debug(ASan/UBSan), Clang Release(공유 라이브러리)에서 실행한다.
+CI는 MSVC Debug/Release × 정적/DLL, GCC Debug(ASan/UBSan), Clang Release(공유 라이브러리)에서 실행한다. 종료 위반 테스트의 의도적인 누수 때문에 `ASAN_OPTIONS=detect_leaks=0`을 사용하므로, 이 CI 설정은 누수 검출을 검증하지 않는다.

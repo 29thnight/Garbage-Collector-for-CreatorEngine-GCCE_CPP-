@@ -33,8 +33,15 @@ add_executable(gcce_tests
     module_test.cpp
     pinned_test.cpp
     edge_test.cpp
+    exception_test.cpp
 )
 target_link_libraries(gcce_tests PRIVATE gcce::gcce GTest::gtest_main)
+
+# A consumer's own older standard must be raised by gcce's usage requirement,
+# not merely by the directory-wide CMAKE_CXX_STANDARD setting.
+add_library(gcce_consumer_standard OBJECT consumer_standard_test.cpp)
+set_target_properties(gcce_consumer_standard PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_link_libraries(gcce_consumer_standard PRIVATE gcce::gcce)
 
 if(MSVC)
     target_compile_options(gcce_tests PRIVATE /W4 /permissive- /bigobj)

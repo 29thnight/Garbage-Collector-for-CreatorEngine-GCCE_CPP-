@@ -52,6 +52,7 @@ struct violation
 
 // The default handler prints the violation and aborts. A replacement handler
 // that returns lets the operation continue; that is meant for tests and tools.
+// Handlers must not throw: reporting is a noexcept path.
 using violation_handler = std::function<void(const violation&)>;
 
 // Handler for violations that belong to no domain (created_outside_make
@@ -62,7 +63,7 @@ GC_API void set_global_violation_handler(violation_handler handler);
 struct collect_result
 {
     bool completed = false; // the cycle reclaimed its candidates
-    bool aborted = false;   // the cycle stopped before reclaiming (protocol violation)
+    bool aborted = false;   // the cycle stopped without using an incomplete mark
     bool refused = false;   // the cycle was not started
     std::size_t marked = 0;
     std::size_t edges_visited = 0;
@@ -72,13 +73,16 @@ struct collect_result
     std::size_t quarantined = 0; // objects moved to quarantine by this cycle
     std::chrono::nanoseconds mark_time{};  // tracing, verification and the reclaim decision
     std::chrono::nanoseconds sweep_time{}; // destructors and slot release
+    std::chrono::nanoseconds startup_time{}; // subset of mark_time: reserves and root scan
+    std::chrono::nanoseconds maintenance_time{}; // allocator end-of-cycle work, separate from sweep_time
 };
 
 using duration = std::chrono::nanoseconds;
 
 // Soft budget for one collect_step. Work is split at object boundaries, so a
 // single large object (a huge container, a slow destructor) or the finalize
-// transition can overrun it; overruns are recorded, not prevented.
+// transition can overrun it; overruns are recorded, not prevented. Startup,
+// sampled batches (up to 8 units), and allocator maintenance can also overrun.
 struct step_budget
 {
     duration time = std::chrono::microseconds(250);
@@ -98,9 +102,12 @@ struct step_result
     bool refused = false;
     std::size_t units = 0;
     duration elapsed{};
-    duration longest_unit{};
+    duration longest_unit{}; // compatibility alias of longest_batch; NOT one object
     duration finalize_time{};
     double budget_scale = 1.0; // > 1 when memory pressure enlarged the budget
+    duration longest_batch{}; // longest clock-sampled batch, excluding startup
+    duration startup_time{};
+    duration maintenance_time{}; // also included in elapsed and the last batch
 };
 
 // What to do when an object with an unfinished cleanup obligation becomes
@@ -171,19 +178,20 @@ struct statistics
     std::uint64_t barrier_stores_during_mark = 0; // non-null stores while marking
     std::uint64_t barrier_shades = 0;             // stores that added gray work
     duration worst_step{};
-    duration worst_unit{};     // longest indivisible unit (one trace or destructor)
+    duration worst_unit{};     // compatibility alias of worst_batch; NOT one object
     duration worst_finalize{}; // longest reclaim-decision transition
     duration last_cycle_wall{}; // start to end of the last finished cycle
     std::uint64_t last_cycle_steps = 0;
 
     // Memory and policy.
     std::size_t peak_live_bytes = 0;
-    std::size_t heap_committed_bytes = 0; // pages plus individually allocated large blocks
+    std::size_t heap_committed_bytes = 0; // allocator accounting, not process RSS
     std::size_t heap_pages = 0;  // pages assigned to a pool
     std::size_t heap_chunks = 0; // 2 MiB OS chunks mapped
     std::size_t memory_limit = 0;
     std::uint64_t allocations_over_limit = 0;
     std::size_t quarantined = 0;
+    duration worst_batch{}; // largest clock-sampled collect_step batch, excluding startup
 };
 
 namespace detail
@@ -210,6 +218,9 @@ public:
     // was requested or the maximum interval elapsed; otherwise does nothing.
     // Owner thread, engine safe points only; never from constructors,
     // tracers or destructors.
+    // Allocation/trace exceptions abandon the current cycle, request a fresh
+    // one, and propagate. No sweep starts from an incomplete mark. Destructors
+    // and violation handlers must not throw; ~domain is noexcept.
     step_result collect_step(const step_budget& budget = {});
 
     // Finishes a cycle in progress, then runs a complete new cycle, for
@@ -293,6 +304,7 @@ private:
     bool do_unit(tracer& t, step_result& r);
     void finalize(tracer& t, step_result& r);
     void finish_cycle(bool completed);
+    void abandon_cycle() noexcept;
     void run_to_cycle_end();
 
     struct impl;

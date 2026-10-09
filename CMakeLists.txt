@@ -23,6 +23,7 @@ else()
 endif()
 add_library(gcce::gcce ALIAS gcce)
 
+target_compile_features(gcce PUBLIC cxx_std_23)
 target_include_directories(gcce PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(gcce PRIVATE ${CMAKE_DL_LIBS})
 if(GCCE_DEBUG_CHECKS STREQUAL "ON")

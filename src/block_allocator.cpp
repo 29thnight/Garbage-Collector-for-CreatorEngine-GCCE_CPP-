@@ -1,4 +1,5 @@
 #include "block_allocator.hpp"
+#include "block_allocator_testing.hpp"
 
 #include "gc/config.hpp"
 
@@ -41,6 +42,17 @@ namespace gc::detail
 {
 namespace
 {
+thread_local allocator_test_state* test_state = nullptr;
+
+void fail_if_requested(allocator_failure point)
+{
+    if (test_state && test_state->fail_at == point)
+    {
+        test_state->fail_at = allocator_failure::none;
+        throw std::bad_alloc();
+    }
+}
+
 constexpr std::array<std::size_t, 24> class_sizes{16,  32,  48,  64,  80,   96,   112,  128,
                                                   160, 192, 224, 256, 320,  384,  448,  512,
                                                   640, 768, 896, 1024, 1280, 1536, 1792, 2048};
@@ -103,6 +115,8 @@ void os_unmap(void* p, std::size_t size) noexcept
 #else
     ::munmap(p, size);
 #endif
+    if (test_state)
+        ++test_state->chunk_unmaps;
 }
 
 // Returns the physical memory of a range while keeping its addresses.
@@ -126,6 +140,13 @@ void os_commit(void* p, std::size_t size)
 #endif
 }
 } // namespace
+
+allocator_test_state* set_allocator_test_state(allocator_test_state* state) noexcept
+{
+    allocator_test_state* previous = test_state;
+    test_state = state;
+    return previous;
+}
 
 struct block_allocator::chunk
 {
@@ -231,21 +252,33 @@ void block_allocator::push_chunk(chunk* c) noexcept
 
 block_allocator::chunk* block_allocator::map_chunk()
 {
+    fail_if_requested(allocator_failure::chunk_metadata);
     auto* c = new chunk;
+    c->index = chunks_.size();
     try
     {
+        fail_if_requested(allocator_failure::chunk_mapping);
         c->base = static_cast<unsigned char*>(os_map(chunk_size, page_size));
+        if (test_state)
+            ++test_state->chunk_maps;
+        fail_if_requested(allocator_failure::chunk_vector);
         chunks_.push_back(c);
+        fail_if_requested(allocator_failure::chunk_index);
+        chunk_index_.emplace(reinterpret_cast<std::uintptr_t>(c->base), c);
     }
     catch (...)
     {
+        // Pointer-vector growth and map insertion leave their containers
+        // unchanged on failure. Undo a completed vector append as well as
+        // the mapping; nothing is on the free-chunk list yet.
+        if (chunks_.size() != c->index)
+            chunks_.pop_back();
         if (c->base)
             os_unmap(c->base, chunk_size);
         delete c;
         throw;
     }
-    c->index = chunks_.size() - 1;
-    chunk_index_.emplace(reinterpret_cast<std::uintptr_t>(c->base), c);
+    // All throwing work is finished before publishing reusable pages.
     GCCE_UNPOISON(c->base, chunk_size); // no stale shadow from an earlier mapping
     GCCE_POISON(c->base, chunk_size);
     push_chunk(c);
@@ -282,8 +315,16 @@ block_allocator::page* block_allocator::new_page(std::uint16_t pool)
             break;
         }
     }
+    bool mapped = false;
     if (!c)
-        c = chunks_with_free_ ? chunks_with_free_ : map_chunk();
+    {
+        c = chunks_with_free_;
+        if (!c)
+        {
+            c = map_chunk();
+            mapped = true;
+        }
+    }
 
     const std::uint32_t warm = c->free_mask & c->committed_mask;
     const auto index = static_cast<unsigned>(std::countr_zero(warm ? warm : c->free_mask));
@@ -296,7 +337,19 @@ block_allocator::page* block_allocator::new_page(std::uint16_t pool)
     }
     else
     {
-        os_commit(memory, page_size);
+        try
+        {
+            fail_if_requested(allocator_failure::page_commit);
+            os_commit(memory, page_size);
+        }
+        catch (...)
+        {
+            // A failed first commit must not retain the mapping or either
+            // index. Existing chunks and their free-page masks stay intact.
+            if (mapped)
+                unmap_chunk(c);
+            throw;
+        }
         c->committed_mask |= bit;
         ++committed_pages_;
     }
@@ -369,19 +422,19 @@ block_allocator::allocation block_allocator::allocate(std::size_t size, std::siz
     {
         const bool plain = mode_ == pool_mode::system && align <= __STDCPP_DEFAULT_NEW_ALIGNMENT__;
         void* block = plain ? ::operator new(size) : ::operator new(size, std::align_val_t{std::max(align, small_align)});
-        individual_bytes_ += size;
 #if GC_DEBUG_CHECKS
         try
         {
+            fail_if_requested(allocator_failure::individual_index);
             individual_blocks_.emplace(reinterpret_cast<std::uintptr_t>(block), size);
         }
         catch (...)
         {
             plain ? ::operator delete(block) : ::operator delete(block, std::align_val_t{std::max(align, small_align)});
-            individual_bytes_ -= size;
             throw;
         }
 #endif
+        individual_bytes_ += size;
         return {block, plain ? system_class : large_class};
     }
 

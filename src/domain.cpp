@@ -75,6 +75,13 @@ constexpr std::size_t units_per_clock_check = 8;
 constexpr std::size_t heavy_unit_edges = 256;
 constexpr const char* quarantine_label = "gc.quarantine";
 
+// Restore reentrancy flags even if a trace or allocation throws.
+struct flag_reset
+{
+    bool& flag;
+    ~flag_reset() { flag = false; }
+};
+
 // vector::reserve sets the capacity exactly, so reserving one more element
 // at a time reallocates every time. Grow geometrically instead.
 template <class T>
@@ -290,6 +297,7 @@ struct domain::impl
     // cycle end), not per unit: reading the clock costs as much as a unit.
     clock::time_point phase_since{};
     bool heavy_unit = false; // the last unit was large enough to check the clock
+    detail::collection_failure next_failure = detail::collection_failure::none;
 
     // ---- statistics
     std::uint64_t cycles_completed = 0;
@@ -299,7 +307,7 @@ struct domain::impl
     std::uint64_t barrier_stores_during_mark = 0;
     std::uint64_t barrier_shades = 0;
     duration worst_step{};
-    duration worst_unit{};
+    duration worst_batch{};
     duration worst_finalize{};
     duration last_cycle_wall{};
     std::uint64_t last_cycle_steps = 0;
@@ -345,10 +353,20 @@ struct domain::impl
         return h;
     }
 
-    void note_unit(duration d, step_result& r) noexcept
+    void note_batch(duration d, step_result& r) noexcept
     {
-        r.longest_unit = std::max(r.longest_unit, d);
-        worst_unit = std::max(worst_unit, d);
+        r.longest_batch = std::max(r.longest_batch, d);
+        r.longest_unit = r.longest_batch;
+        worst_batch = std::max(worst_batch, d);
+    }
+
+    void fail_collection_allocation(detail::collection_failure point)
+    {
+        if (next_failure == point)
+        {
+            next_failure = detail::collection_failure::none;
+            throw std::bad_alloc{};
+        }
     }
 };
 
@@ -445,7 +463,8 @@ statistics domain::stats() const
     st.barrier_stores_during_mark = s.barrier_stores_during_mark;
     st.barrier_shades = s.barrier_shades;
     st.worst_step = s.worst_step;
-    st.worst_unit = s.worst_unit;
+    st.worst_batch = s.worst_batch;
+    st.worst_unit = s.worst_batch;
     st.worst_finalize = s.worst_finalize;
     st.last_cycle_wall = s.last_cycle_wall;
     st.last_cycle_steps = s.last_cycle_steps;
@@ -744,6 +763,10 @@ bool domain::enter_collection(bool& refused) noexcept
 void domain::start_cycle()
 {
     impl& s = *impl_;
+    s.cycle_start = clock::now();
+    s.phase_since = s.cycle_start;
+    s.current = collect_result{};
+    s.cycle_steps = 0;
     if (++s.epoch == 0)
     {
         // Epoch wrap: clear stale marks once so no object looks marked.
@@ -752,20 +775,17 @@ void domain::start_cycle()
             if (sl.header)
                 sl.header->mark_epoch = 0;
     }
-    s.current = collect_result{};
-    s.cycle_start = clock::now();
-    s.phase_since = s.cycle_start;
-    s.cycle_steps = 0;
     s.requested = false;
     s.bytes_since_last_cycle = 0;
     s.suspects.clear();
     s.verify_cursor = 0;
     s.clear_gray();
     s.gray_reserved = s.live_objects;
-    reserve_at_least(s.gray, s.gray_reserved);
-
     phase_ = phase::marking;
     s.current_stage = stage::trace;
+    if (s.gray_reserved > s.gray.capacity())
+        s.fail_collection_allocation(detail::collection_failure::gray_reserve);
+    reserve_at_least(s.gray, s.gray_reserved);
 
     // Roots are scanned in one piece. Roots added later are shaded by the
     // barrier when they are linked, and removing a root needs no work.
@@ -773,6 +793,7 @@ void domain::start_cycle()
         shade(n->header);
     for (detail::object_header* h : s.quarantine)
         shade(h);
+    s.current.startup_time = clock::now() - s.cycle_start;
 }
 
 bool domain::do_unit(tracer& t, step_result& r)
@@ -787,9 +808,9 @@ bool domain::do_unit(tracer& t, step_result& r)
         {
             detail::object_header* h = s.next_gray();
             s.tracing = true;
+            const flag_reset tracing_guard{s.tracing};
             h->type->trace(h->object, t);
             t.flush();
-            s.tracing = false;
             ++s.current.marked;
             const std::size_t edges = std::exchange(t.edges_, 0);
             s.current.edges_visited += edges;
@@ -813,7 +834,11 @@ bool domain::do_unit(tracer& t, step_result& r)
             {
                 detail::object_header* h = s.slots[s.verify_cursor].header;
                 if (h && h->cleanup_obligation && !is_marked(h))
+                {
+                    if (s.suspects.size() == s.suspects.capacity())
+                        s.fail_collection_allocation(detail::collection_failure::suspects_growth);
                     s.suspects.push_back(h);
+                }
             }
             return true;
         }
@@ -851,15 +876,17 @@ void domain::finalize(tracer& t, step_result& r)
     impl& s = *impl_;
     const auto t0 = clock::now();
 
-    s.tracing = true;
-    while (!s.gray_empty())
     {
-        detail::object_header* h = s.next_gray();
-        h->type->trace(h->object, t);
-        t.flush();
-        ++s.current.marked;
+        s.tracing = true;
+        const flag_reset tracing_guard{s.tracing};
+        while (!s.gray_empty())
+        {
+            detail::object_header* h = s.next_gray();
+            h->type->trace(h->object, t);
+            t.flush();
+            ++s.current.marked;
+        }
     }
-    s.tracing = false;
     s.current.edges_visited += std::exchange(t.edges_, 0);
 
     // Objects that gained an obligation after the verify scan were shaded,
@@ -874,8 +901,10 @@ void domain::finalize(tracer& t, step_result& r)
             {
                 // From the next cycle on it is a root, so its subgraph stays
                 // and the rest of the garbage is reclaimed again.
-                h->quarantined = true;
+                if (s.quarantine.size() == s.quarantine.capacity())
+                    s.fail_collection_allocation(detail::collection_failure::quarantine_growth);
                 s.quarantine.push_back(h);
+                h->quarantined = true; // publish only after the vector owns it
                 ++s.current.quarantined;
             }
         }
@@ -907,13 +936,17 @@ void domain::finalize(tracer& t, step_result& r)
 void domain::finish_cycle(bool completed)
 {
     impl& s = *impl_;
-    const auto now = clock::now();
+    const auto maintenance_start = clock::now();
     if (completed)
-        s.current.sweep_time += now - s.phase_since;
+        s.current.sweep_time += maintenance_start - s.phase_since;
     phase_ = phase::idle;
     s.current_stage = stage::idle;
     s.clear_gray();
     s.suspects.clear();
+
+    s.allocator.end_cycle();
+    const auto now = clock::now();
+    s.current.maintenance_time += now - maintenance_start;
 
     s.current.completed = completed;
     s.current.aborted = !completed;
@@ -925,7 +958,33 @@ void domain::finish_cycle(bool completed)
     s.last_cycle_wall = now - s.cycle_start;
     s.last_cycle_steps = s.cycle_steps;
     s.last_cycle_end = now;
-    s.allocator.end_cycle();
+}
+
+void domain::abandon_cycle() noexcept
+{
+    impl& s = *impl_;
+    const auto now = clock::now();
+    if (phase_ == phase::marking)
+        s.current.mark_time += now - s.phase_since;
+    else if (phase_ == phase::sweeping)
+        s.current.sweep_time += now - s.phase_since;
+
+    // The failed tracer may already have popped an object and buffered only
+    // some edges. Never resume that mark or make a reclaim decision from it.
+    phase_ = phase::idle;
+    s.current_stage = stage::idle;
+    s.clear_gray();
+    s.suspects.clear();
+    s.tracing = false;
+    s.requested = true;
+    s.current.completed = false;
+    s.current.aborted = true;
+    ++s.cycles_aborted;
+    s.last = s.current;
+    s.last_cycle_wall = now - s.cycle_start;
+    s.last_cycle_steps = s.cycle_steps;
+    s.last_cycle_end = now;
+    // Do not allocate, trace, destroy, or run allocator maintenance here.
 }
 
 void domain::run_to_cycle_end()
@@ -952,86 +1011,95 @@ step_result domain::collect_step(const step_budget& budget)
         return r;
     }
 
-    const auto start = clock::now();
-    if (phase_ == phase::idle)
+    const flag_reset collection_guard{s.in_collection};
+    try
     {
-        const bool interval_due = s.max_cycle_interval > duration::zero() &&
-                                  start - s.last_cycle_end >= s.max_cycle_interval;
-        if (!s.requested && !interval_due)
+        const auto start = clock::now();
+        if (phase_ == phase::idle)
         {
-            s.in_collection = false;
-            r.after = phase_;
-            return r;
+            const bool interval_due = s.max_cycle_interval > duration::zero() &&
+                                      start - s.last_cycle_end >= s.max_cycle_interval;
+            if (!s.requested && !interval_due)
+            {
+                r.after = phase_;
+                return r;
+            }
+            start_cycle();
+            r.cycle_started = true;
+            r.startup_time = s.current.startup_time;
         }
-        start_cycle();
-        r.cycle_started = true;
-    }
 
-    // Memory pressure enlarges the budget so the cycle finishes sooner.
-    if (const std::size_t limit = s.pacing_config.memory_limit; limit != 0)
-    {
-        const double used = static_cast<double>(s.live_bytes) / static_cast<double>(limit);
-        const double from = s.pacing_config.start_fraction;
-        const double t = from < 1.0 ? std::clamp((used - from) / (1.0 - from), 0.0, 1.0) : (used >= 1.0 ? 1.0 : 0.0);
-        r.budget_scale = 1.0 + (std::max(s.pacing_config.max_budget_scale, 1.0) - 1.0) * t;
-    }
-    const auto time_budget = std::chrono::duration_cast<duration>(budget.time * r.budget_scale);
-    const auto min_units = static_cast<std::size_t>(static_cast<double>(budget.min_units) * r.budget_scale);
-
-    ++s.steps;
-    ++s.cycle_steps;
-    if (!r.cycle_started)
-        s.phase_since = start; // resume phase accounting; mutator time is excluded
-    tracer t(*this);
-    auto last_check = start;
-    std::size_t since_check = 0;
-    auto check_clock = [&] {
-        const auto now = clock::now();
-        s.note_unit(now - last_check, r);
-        last_check = now;
-        since_check = 0;
-        return now;
-    };
-    for (;;)
-    {
-        const bool more = do_unit(t, r);
-        ++r.units;
-        ++since_check;
-        if (!more)
+        // Memory pressure enlarges the budget so the cycle finishes sooner.
+        if (const std::size_t limit = s.pacing_config.memory_limit; limit != 0)
         {
-            r.cycle_finished = true;
-            check_clock();
-            break;
+            const double used = static_cast<double>(s.live_bytes) / static_cast<double>(limit);
+            const double from = s.pacing_config.start_fraction;
+            const double t = from < 1.0 ? std::clamp((used - from) / (1.0 - from), 0.0, 1.0) : (used >= 1.0 ? 1.0 : 0.0);
+            r.budget_scale = 1.0 + (std::max(s.pacing_config.max_budget_scale, 1.0) - 1.0) * t;
         }
-        const bool check = s.heavy_unit || since_check >= units_per_clock_check;
-        if (r.units < min_units)
+        const auto time_budget = std::chrono::duration_cast<duration>(budget.time * r.budget_scale);
+        const auto min_units = static_cast<std::size_t>(static_cast<double>(budget.min_units) * r.budget_scale);
+
+        ++s.steps;
+        ++s.cycle_steps;
+        if (!r.cycle_started)
+            s.phase_since = start; // resume phase accounting; mutator time is excluded
+        tracer t(*this);
+        auto last_check = clock::now(); // exclude startup from sampled batches
+        std::size_t since_check = 0;
+        auto check_clock = [&] {
+            const auto now = clock::now();
+            s.note_batch(now - last_check, r);
+            last_check = now;
+            since_check = 0;
+            return now;
+        };
+        for (;;)
         {
-            if (check)
+            const bool more = do_unit(t, r);
+            ++r.units;
+            ++since_check;
+            if (!more)
+            {
+                r.cycle_finished = true;
+                r.maintenance_time = s.last.maintenance_time;
                 check_clock();
-            continue;
+                break;
+            }
+            const bool check = s.heavy_unit || since_check >= units_per_clock_check;
+            if (r.units < min_units)
+            {
+                if (check)
+                    check_clock();
+                continue;
+            }
+            if (time_budget <= duration::zero())
+            {
+                check_clock();
+                break;
+            }
+            if (check && check_clock() - start >= time_budget)
+                break;
         }
-        if (time_budget <= duration::zero())
-        {
-            check_clock();
-            break;
-        }
-        if (check && check_clock() - start >= time_budget)
-            break;
+
+        const auto end = clock::now();
+        if (phase_ == phase::marking)
+            s.current.mark_time += end - s.phase_since;
+        else if (phase_ == phase::sweeping)
+            s.current.sweep_time += end - s.phase_since;
+        r.elapsed = end - start;
+        r.over_budget = r.elapsed > time_budget;
+        s.steps_over_budget += r.over_budget;
+        s.worst_step = std::max(s.worst_step, r.elapsed);
+
+        r.after = phase_;
+        return r;
     }
-
-    const auto end = clock::now();
-    if (phase_ == phase::marking)
-        s.current.mark_time += end - s.phase_since;
-    else if (phase_ == phase::sweeping)
-        s.current.sweep_time += end - s.phase_since;
-    r.elapsed = end - start;
-    r.over_budget = r.elapsed > time_budget;
-    s.steps_over_budget += r.over_budget;
-    s.worst_step = std::max(s.worst_step, r.elapsed);
-
-    s.in_collection = false;
-    r.after = phase_;
-    return r;
+    catch (...)
+    {
+        abandon_cycle();
+        throw;
+    }
 }
 
 collect_result domain::collect_full()
@@ -1045,16 +1113,24 @@ collect_result domain::collect_full()
         return result;
     }
 
-    if (phase_ != phase::idle)
+    const flag_reset collection_guard{s.in_collection};
+    try
     {
-        s.phase_since = clock::now();
+        if (phase_ != phase::idle)
+        {
+            s.phase_since = clock::now();
+            run_to_cycle_end();
+        }
+        start_cycle();
         run_to_cycle_end();
-    }
-    start_cycle();
-    run_to_cycle_end();
 
-    s.in_collection = false;
-    return s.last;
+        return s.last;
+    }
+    catch (...)
+    {
+        abandon_cycle();
+        throw;
+    }
 }
 // ------------------------------------------------------------ diagnostics
 
@@ -1124,9 +1200,11 @@ std::vector<object_info> domain::retention_path(const detail::object_header* tar
     {
         const detail::object_header* h = frontier[i];
         edges.clear();
-        s.tracing = true;
-        h->type->trace(h->object, t);
-        s.tracing = false;
+        {
+            s.tracing = true;
+            const flag_reset tracing_guard{s.tracing};
+            h->type->trace(h->object, t);
+        }
         for (const detail::object_header* child : edges)
             if (seen.emplace(child, origin{h, nullptr}).second)
                 frontier.push_back(child);
@@ -1188,6 +1266,11 @@ void domain_testing::set_slot_generation(domain& d, std::uint32_t slot, std::uin
     sl.generation = generation;
     if (sl.header)
         sl.header->generation = generation;
+}
+
+void domain_testing::fail_next_collection_allocation(domain& d, collection_failure point) noexcept
+{
+    d.impl_->next_failure = point;
 }
 } // namespace detail
 } // namespace gc
